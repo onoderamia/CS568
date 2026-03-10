@@ -1,0 +1,16 @@
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# backend
+backend/__pycache__/
+backend/*.pyc
+backend/.env
+__pycache__/
+*.pyc
+
+# general
+.DS_Store
+*.egg-info/
