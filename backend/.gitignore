@@ -1,0 +1,46 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Hugging Face cache (if you ever set HF_HOME to project dir)
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Optional: uncomment to avoid committing large adapter weights (get them from Colab/cloud instead)
+# models/

@@ -1,0 +1,5 @@
+# For inference on M1 / CPU (no Unsloth - Unsloth is NVIDIA/AMD/Intel only)
+transformers>=4.43.0
+accelerate
+peft
+torch
