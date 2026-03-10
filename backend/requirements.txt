@@ -3,3 +3,5 @@ transformers>=4.43.0
 accelerate
 peft
 torch
+flask
+flask-cors

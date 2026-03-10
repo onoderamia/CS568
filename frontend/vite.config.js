@@ -13,6 +13,11 @@ export default defineConfig({
           "anthropic-version": "2023-06-01",
           "anthropic-dangerous-direct-browser-access": "true"
         }
+      },
+      "/api/model": {
+        target: "http://localhost:5001",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/model/, "/api")
       }
     }
   }
