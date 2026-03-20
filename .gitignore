@@ -14,3 +14,4 @@ __pycache__/
 # general
 .DS_Store
 *.egg-info/
+.claude/
