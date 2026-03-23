@@ -10,6 +10,7 @@ Endpoints:
                             }
 """
 
+import logging
 import os
 import re
 
@@ -26,6 +27,8 @@ from peft import PeftModel
 
 app = Flask(__name__)
 CORS(app)
+
+logger = logging.getLogger(__name__)
 
 BASE_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
 BPO_ADAPTER_PATH = "models/smollm_bpo_lora"
@@ -62,9 +65,9 @@ OPTIMIZE_SYSTEM_PROMPT = (
     "2. Preserve the original user intent exactly — do not change what is being asked.\n"
     "3. Do NOT answer, fulfill, or respond to the content of the prompt — only rewrite it.\n"
     "4. If the original is a question, keep it as a question. If it is a task, keep it as a task.\n"
-    "5. Keep the rewritten prompt under 80 words.\n"
+    "5. Keep the rewritten prompt under 110 words and aim for 2-3 sentences.\n"
     "6. Improve: specificity, clarity, context, role framing, and actionability.\n"
-    "7. Add constraints or output format hints where helpful.\n"
+    "7. Include at least two concrete constraints (for example scope, audience, length, criteria) and an explicit output format hint.\n"
     "8. Never start with 'Rewritten:', 'Optimized:', or any label."
 )
 
@@ -100,42 +103,155 @@ SCORE_SYSTEM_PROMPT = (
 
 
 def run_optimize(prompt: str) -> str:
-    messages = [
-        {"role": "system", "content": OPTIMIZE_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Optimize this prompt: {prompt}"},
-    ]
-    input_text = opt_tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = opt_tokenizer(input_text, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = opt_model.generate(
-            **inputs,
-            max_new_tokens=200,
-            do_sample=False,
-            repetition_penalty=1.15,
-            pad_token_id=opt_tokenizer.eos_token_id,
+    def _generate(messages, max_new_tokens=140):
+        input_text = opt_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-    input_len = inputs.input_ids.shape[1]
-    reply = opt_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
-    # Strip special tokens
-    for stop in ["<|im_end|>", "<|endoftext|>"]:
-        if stop in reply:
-            reply = reply.split(stop)[0].strip()
-    # Strip meta-commentary prefixes BEFORE cutting on newlines, so we don't lose the content
-    prefixes_to_strip = [
-        "Here's an optimized version of your prompt:",
-        "Here's a rewritten version:",
-        "Here's the optimized prompt:",
-        "Rewritten:", "Optimized:", "Improved:", "Result:",
-        "Optimized prompt:", "Rewritten prompt:",
-    ]
-    for prefix in prefixes_to_strip:
-        if reply.lower().startswith(prefix.lower()):
-            reply = reply[len(prefix):].strip()
-            break
-    return reply
+        inputs = opt_tokenizer(input_text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = opt_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                repetition_penalty=1.15,
+                pad_token_id=opt_tokenizer.eos_token_id,
+            )
+        input_len = inputs.input_ids.shape[1]
+        return opt_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
+    def _cleanup(text):
+        for stop in ["<|im_end|>", "<|endoftext|>"]:
+            if stop in text:
+                text = text.split(stop)[0].strip()
+        prefixes_to_strip = [
+            "Here's an optimized version of your prompt:",
+            "Here's a rewritten version:",
+            "Here's the optimized prompt:",
+            "Rewritten:", "Optimized:", "Improved:", "Result:",
+            "Optimized prompt:", "Rewritten prompt:",
+        ]
+        for prefix in prefixes_to_strip:
+            if text.lower().startswith(prefix.lower()):
+                text = text[len(prefix):].strip()
+                break
+        text = text.replace("\n", " ").strip()
+        text = re.sub(r"\b(and|or|with|to|for|that|which|including)\s*[.:;!?]?$", "", text, flags=re.IGNORECASE).strip()
+        if text and text[-1] not in ".!?":
+            last_full_stop = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+            if last_full_stop >= 20:
+                text = text[: last_full_stop + 1].strip()
+            else:
+                text = f"{text}."
+        if text.count('"') % 2 == 1:
+            text += '"'
+        if text.count("(") > text.count(")"):
+            text += ")" * (text.count("(") - text.count(")"))
+        return text
+
+    def _rewrite_failure_reason(text, original):
+        """Return None if rewrite passes validation; otherwise a short reason code for logging."""
+        t = text.lower().strip()
+        o = original.lower().strip()
+        if not t:
+            return "empty_output"
+        if t == o:
+            return "unchanged_from_original"
+
+        # Meta wrappers / commentary means model didn't follow "output only rewrite".
+        meta_prefixes = (
+            "here's", "here is", "rewritten:", "optimized:", "improved:",
+            "this prompt", "the rewritten prompt", "the optimized prompt",
+        )
+        if t.startswith(meta_prefixes):
+            return "meta_wrapper_or_commentary_prefix"
+
+        # Preserve original interaction form (question vs task).
+        question_starts = (
+            "what", "how", "why", "when", "where", "which", "who",
+            "can", "could", "would", "should", "is", "are", "do", "does",
+        )
+        orig_is_question = o.endswith("?") or o.startswith(question_starts)
+        rewrite_is_question = t.endswith("?") or t.startswith(question_starts)
+        if orig_is_question != rewrite_is_question:
+            return (
+                "question_task_form_mismatch: "
+                f"original_is_question={orig_is_question}, rewrite_is_question={rewrite_is_question}"
+            )
+
+        # Detect answer-like narrative openings (we want rewritten instructions).
+        answer_like_starts = (
+            "to ", "first", "second", "third", "there are", "it is", "it's",
+            "this is", "in this", "the best way",
+        )
+        if t.startswith(answer_like_starts):
+            for prefix in answer_like_starts:
+                if t.startswith(prefix):
+                    return f"answer_like_opening:{prefix.strip()!r}"
+            return "answer_like_opening"
+
+        # Common giveaway that model is explaining rather than rewriting.
+        commentary_phrases = (
+            "this version", "this rewrite", "i rewrote", "maintains the same intent",
+        )
+        for phrase in commentary_phrases:
+            if phrase in t:
+                return f"commentary_phrase:{phrase!r}"
+
+        word_count = len(t.split())
+        if word_count < 10:
+            return f"too_short:word_count={word_count}"
+        return None
+
+    primary_messages = [
+        {"role": "system", "content": OPTIMIZE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Optimize this prompt. Keep the same intent, but make the rewritten prompt more specific "
+                "and structured in 2-3 sentences with clear constraints and output format guidance: "
+                f"{prompt}"
+            ),
+        },
+    ]
+    reply = _cleanup(_generate(primary_messages))
+    primary_reason = _rewrite_failure_reason(reply, prompt)
+    if primary_reason is None:
+        return reply
+
+    logger.info(
+        "[optimize] retry triggered: primary failed validation (%s); preview=%r",
+        primary_reason,
+        (reply[:240] + "…") if len(reply) > 240 else reply,
+    )
+
+    # Strict retry for malformed / answer-like / too-weak output.
+    strict_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Rewrite the user's prompt only. Do not answer it. "
+                "Return only the rewritten prompt text in 2-3 sentences."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Original prompt: {prompt}\n"
+                "Rewrite it with clearer scope, explicit constraints, and output format expectations."
+            ),
+        },
+    ]
+    retry = _cleanup(_generate(strict_messages, max_new_tokens=170))
+    retry_reason = _rewrite_failure_reason(retry, prompt)
+    if retry_reason is not None:
+        logger.warning(
+            "[optimize] second pass still failed validation (%s); returning it anyway; preview=%r",
+            retry_reason,
+            (retry[:240] + "…") if len(retry) > 240 else retry,
+        )
+    else:
+        logger.info("[optimize] second pass passed validation")
+    return retry
 
 def _parse_numeric_score(text: str) -> float:
     """Extract a numeric score from model output, defaulting to 1.0–5.0 range."""
@@ -216,4 +332,8 @@ def score_dims():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     app.run(port=5001, debug=False)
