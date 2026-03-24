@@ -1,34 +1,65 @@
 import { useState, useRef, useEffect } from "react";
 import "./App.css";
 
+/** Display order requested: coherence → complexity → helpfulness → correctness → verbosity */
+const DIMENSION_ORDER = [
+  "coherence",
+  "complexity",
+  "helpfulness",
+  "correctness",
+  "verbosity",
+];
+
 const SCORE_COLORS = {
-  clarity: "#4ade80",
-  specificity: "#60a5fa",
-  ambiguity: "#f59e0b",
-  tone: "#a78bfa",
+  coherence: "#60a5fa",
+  complexity: "#c084fc",
+  helpfulness: "#4ade80",
+  correctness: "#f59e0b",
+  verbosity: "#94a3b8",
 };
 
-function generateFeedback(scores) {
-  const issues = [];
-  if (scores.clarity < 50) issues.push("could be clearer");
-  if (scores.specificity < 50) issues.push("lacks specifics");
-  if (scores.ambiguity < 50) issues.push("contains ambiguity");
-  if (scores.tone < 50) issues.push("tone could be improved");
-  if (issues.length === 0) {
-    return "Your prompt scores well across all dimensions. The optimized version below adds further polish for even better AI responses.";
-  }
-  return `Your prompt ${issues.join(" and ")}. See the optimized version below for a refined approach.`;
+const DIMENSION_LABELS = {
+  coherence: "Coherence",
+  complexity: "Complexity",
+  helpfulness: "Helpfulness",
+  correctness: "Correctness",
+  verbosity: "Verbosity",
+};
+
+/** value: integer 1–5 */
+function ScoreBarFive({ dimKey, value, color }) {
+  const pct = ((Number(value) - 1) / 4) * 100;
+  const label = DIMENSION_LABELS[dimKey] || dimKey;
+  return (
+    <div className="score-row score-row--five">
+      <span className="score-label">{label}</span>
+      <div className="score-track" aria-hidden>
+        <div
+          className="score-fill"
+          style={{ width: `${pct}%`, background: color }}
+        />
+      </div>
+      <span className="score-value score-value--five">
+        {value}
+        <span className="score-out-of">/5</span>
+      </span>
+    </div>
+  );
 }
 
-function ScoreBar({ label, value, color }) {
+function DimensionFeedbackCard({ dimKey, score, explanation, color }) {
+  const label = DIMENSION_LABELS[dimKey] || dimKey;
   return (
-    <div className="score-row">
-      <span className="score-label">{label}</span>
-      <div className="score-track">
-        <div className="score-fill" style={{ width: `${value}%`, background: color }} />
-      </div>
-      <span className="score-value">{value}</span>
-    </div>
+    <article className="dimension-card" style={{ "--dim-accent": color }}>
+      <header className="dimension-card__head">
+        <h4 className="dimension-card__title">{label}</h4>
+        <span className="dimension-card__badge" title="Score 1–5">
+          {score}
+          <span className="dimension-card__badge-denom">/5</span>
+        </span>
+      </header>
+      <p className="dimension-card__feedback">{explanation || "—"}</p>
+    </article>
   );
 }
 
@@ -46,43 +77,70 @@ function CopyButton({ text }) {
   );
 }
 
+/** value: mean dimension score 1–5 */
 function OverallScore({ value }) {
-  const color =
-    value >= 75 ? "#4ade80" : value >= 50 ? "#f59e0b" : "#f87171";
+  const n = Number(value);
+  const color = n >= 4 ? "#4ade80" : n >= 3 ? "#f59e0b" : "#f87171";
   return (
     <div className="overall-score-row">
-      <span className="overall-label">Overall</span>
+      <span className="overall-label">Overall (avg)</span>
       <div className="overall-ring" style={{ "--ring-color": color }}>
-        <span className="overall-number" style={{ color }}>{value}</span>
-        <span className="overall-denom">/100</span>
+        <span className="overall-number" style={{ color }}>
+          {value}
+        </span>
+        <span className="overall-denom">/5</span>
       </div>
     </div>
   );
 }
 
 function CheckResult({ msg }) {
+  const orderedDims =
+    msg.scores && DIMENSION_ORDER.filter((d) => msg.scores[d] != null);
   return (
     <div className="message assistant">
       <div className="result-card">
-        {msg.scores && (
+        {msg.scores && orderedDims?.length > 0 && (
           <div className="result-section">
-            <h3 className="section-title">Dimension Scores</h3>
-            {Object.entries(msg.scores).map(([key, val]) => (
-              <ScoreBar
+            <h3 className="section-title">Quality scores (1–5)</h3>
+            <p className="section-hint">
+              Scores rate a brief AI draft of your prompt (same setup as
+              training). Explanations come from the base model.
+            </p>
+            {orderedDims.map((key) => (
+              <ScoreBarFive
                 key={key}
-                label={key.charAt(0).toUpperCase() + key.slice(1)}
-                value={val}
-                color={SCORE_COLORS[key]}
+                dimKey={key}
+                value={msg.scores[key]}
+                color={SCORE_COLORS[key] || "#7c6af5"}
               />
             ))}
             {msg.overall != null && <OverallScore value={msg.overall} />}
           </div>
         )}
-        {msg.feedback && (
-          <div className="result-section">
-            <h3 className="section-title">Feedback</h3>
-            <p className="feedback-text">{msg.feedback}</p>
+        {msg.explanations && orderedDims?.length > 0 && (
+          <div className="result-section result-section--feedback-grid">
+            <h3 className="section-title">Feedback by dimension</h3>
+            <div className="dimension-grid">
+              {orderedDims.map((key) => (
+                <DimensionFeedbackCard
+                  key={key}
+                  dimKey={key}
+                  score={msg.scores[key]}
+                  explanation={msg.explanations[key]}
+                  color={SCORE_COLORS[key] || "#7c6af5"}
+                />
+              ))}
+            </div>
           </div>
+        )}
+        {msg.draft_reply && (
+          <details className="draft-details">
+            <summary className="draft-details__summary">
+              Draft reply used for scoring
+            </summary>
+            <div className="draft-details__body">{msg.draft_reply}</div>
+          </details>
         )}
         {msg.improved && (
           <div className="result-section">
@@ -98,7 +156,8 @@ function CheckResult({ msg }) {
         {!msg.scores && !msg.improved && (
           <div className="result-section">
             <p className="feedback-text" style={{ color: "var(--muted)" }}>
-              Backend unavailable — make sure the Flask server is running on port 5001.
+              Backend unavailable — make sure the Flask server is running on
+              port 5001.
             </p>
           </div>
         )}
@@ -142,7 +201,9 @@ function Message({ msg }) {
   if (msg.type === "generate") return <GenerateResult msg={msg} />;
   return (
     <div className="message assistant">
-      <div className={`bubble assistant-bubble ${msg.type === "error" ? "error-bubble" : ""}`}>
+      <div
+        className={`bubble assistant-bubble ${msg.type === "error" ? "error-bubble" : ""}`}
+      >
         {msg.content}
       </div>
     </div>
@@ -153,7 +214,9 @@ function Thinking() {
   return (
     <div className="message assistant">
       <div className="bubble assistant-bubble thinking">
-        <span /><span /><span />
+        <span />
+        <span />
+        <span />
       </div>
     </div>
   );
@@ -161,7 +224,7 @@ function Thinking() {
 
 const WELCOME = {
   check:
-    "Paste your prompt below and I'll score it across clarity, specificity, ambiguity, and tone — then generate an optimized version using our fine-tuned model.",
+    "Paste your prompt and I'll score a quick AI draft on helpfulness, correctness, coherence, complexity, and verbosity (1–5), explain each with the base model, then show an optimized prompt.",
   generate:
     "Describe your idea or task and I'll craft a polished, ready-to-use prompt for you.",
 };
@@ -175,7 +238,9 @@ export default function App() {
   const [mode, setMode] = useState("check");
   // Separate message histories per mode — preserved when switching tabs
   const [checkMessages, setCheckMessages] = useState(INIT_MESSAGES.check);
-  const [generateMessages, setGenerateMessages] = useState(INIT_MESSAGES.generate);
+  const [generateMessages, setGenerateMessages] = useState(
+    INIT_MESSAGES.generate,
+  );
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
@@ -230,7 +295,8 @@ export default function App() {
             type: "check",
             scores: dims.scores,
             overall: dims.overall,
-            feedback: generateFeedback(dims.scores),
+            explanations: dims.explanations,
+            draft_reply: dims.draft_reply,
             improved: opt.optimized,
           },
         ]);
@@ -349,7 +415,14 @@ export default function App() {
               disabled={loading || !input.trim()}
               aria-label="Send"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+              >
                 <line x1="22" y1="2" x2="11" y2="13" />
                 <polygon points="22 2 15 22 11 13 2 9 22 2" />
               </svg>

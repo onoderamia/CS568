@@ -4,12 +4,18 @@ Runs on http://localhost:5001
 
 Endpoints:
   POST /api/optimize       { "prompt": "..." }  ->  { "optimized": "..." }
-  POST /api/score_dims     { "prompt": "..." }  ->  {
-                              "overall": 0-100,
-                              "scores": { "clarity": ..., "specificity": ..., "ambiguity": ..., "tone": ... }
+  POST /api/score_dims     { "prompt": "...", "response"?: "..." }  ->  {
+                              "overall": 1-5 (int, mean of dimensions),
+                              "scores": { helpfulness, correctness, coherence, complexity, verbosity },
+                              "explanations": { same keys -> short strings },
+                              "draft_reply": optional assistant draft used for scoring
                             }
 """
 
+from __future__ import annotations
+
+import hashlib
+import json
 import logging
 import os
 import re
@@ -20,38 +26,96 @@ os.environ["USE_JAX"] = "0"
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 import torch
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 app = Flask(__name__)
 CORS(app)
 
 logger = logging.getLogger(__name__)
 
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
-BPO_ADAPTER_PATH = "models/smollm_bpo_lora"
-RANKED_ADAPTER_PATH = "models/smollm_ranked_lora"
+BPO_ADAPTER_PATH = os.path.join(_BACKEND_DIR, "models", "smollm_bpo_lora")
+HELPSTEER_ADAPTER_PATH = os.path.join(_BACKEND_DIR, "models", "smollm_helpsteer_rater_lora")
+RANKED_ADAPTER_FALLBACK_PATH = os.path.join(_BACKEND_DIR, "models", "smollm_ranked_lora")
 
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-dtype = torch.float16 if device != "cpu" else torch.float32
+# Order matches HelpSteer training JSON (sort_keys=True in training).
+HELPSTEER_DIMENSIONS = (
+    "helpfulness",
+    "correctness",
+    "coherence",
+    "complexity",
+    "verbosity",
+)
 
+RATER_SYSTEM = (
+    "You are an expert evaluator of assistant replies. "
+    "Given a user prompt and an assistant response, output ONE compact JSON object only "
+    "(no markdown, no prose). Keys exactly: "
+    "helpfulness, correctness, coherence, complexity, verbosity. "
+    "Each value is an integer from 1 to 5 (1 worst, 5 best). "
+    "helpfulness = how well the response addresses the user's need; "
+    "correctness = factual soundness; coherence = clarity and logical flow; "
+    "complexity = intellectual depth appropriate to the task; "
+    "verbosity = appropriate detail without excess padding."
+)
+
+EXPLAIN_SYSTEM = (
+    "You write concise feedback for a draft assistant reply. "
+    "You receive the user prompt, the draft reply, and integer scores 1–5 for: "
+    "helpfulness, correctness, coherence, complexity, verbosity. "
+    "Output ONE JSON object with exactly those five keys. "
+    "CRITICAL: each value MUST be a JSON string in double quotes — a full English sentence (10+ words). "
+    "Never use a bare number as a value (wrong: \"helpfulness\":4). "
+    "Right: \"helpfulness\":\"The reply addresses the request but could be more actionable.\" "
+    "Do not repeat the numeric score in the sentence. No markdown, no code fences."
+)
+
+
+def _pick_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+device = _pick_device()
+dtype = torch.float32 if device == "cpu" else torch.float16
+
+print(f"[server] device={device} dtype={dtype}")
 print("[server] Loading tokenizer from base model...")
-# Load tokenizer from base model — the adapter tokenizer_configs use a non-standard class
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 opt_tokenizer = tokenizer
 score_tokenizer = tokenizer
 
-print(f"[server] Loading BPO (optimize) model on {device}...")
+print(f"[server] Loading BPO (optimize) model...")
 _base_opt = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, dtype=dtype)
 opt_model = PeftModel.from_pretrained(_base_opt, BPO_ADAPTER_PATH)
 opt_model.to(device)
 opt_model.eval()
 
-print(f"[server] Loading ranked (scoring) model on {device}...")
+print(f"[server] Loading HelpSteer rater (base + LoRA) from {HELPSTEER_ADAPTER_PATH}...")
 _base_score = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, dtype=dtype)
-score_model = PeftModel.from_pretrained(_base_score, RANKED_ADAPTER_PATH)
+_score_adapter_path = HELPSTEER_ADAPTER_PATH
+if not os.path.exists(os.path.join(_score_adapter_path, "adapter_config.json")):
+    logger.warning(
+        "[server] HelpSteer adapter missing adapter_config.json at %s; falling back to %s",
+        _score_adapter_path,
+        RANKED_ADAPTER_FALLBACK_PATH,
+    )
+    _score_adapter_path = RANKED_ADAPTER_FALLBACK_PATH
+
+if not os.path.exists(os.path.join(_score_adapter_path, "adapter_config.json")):
+    raise FileNotFoundError(
+        "No valid scoring adapter found. Expected adapter_config.json in either "
+        f"{HELPSTEER_ADAPTER_PATH} or {RANKED_ADAPTER_FALLBACK_PATH}."
+    )
+
+score_model = PeftModel.from_pretrained(_base_score, _score_adapter_path)
 score_model.to(device)
 score_model.eval()
 
@@ -69,36 +133,6 @@ OPTIMIZE_SYSTEM_PROMPT = (
     "6. Improve: specificity, clarity, context, role framing, and actionability.\n"
     "7. Include at least two concrete constraints (for example scope, audience, length, criteria) and an explicit output format hint.\n"
     "8. Never start with 'Rewritten:', 'Optimized:', or any label."
-)
-
-DIMENSION_GUIDELINES = {
-    "clarity": (
-        "how clear, direct, and easy to understand the prompt is for an AI assistant. "
-        "A score of 5 means the prompt is perfectly clear with no confusion possible. "
-        "A score of 1 means the prompt is very hard to parse or understand."
-    ),
-    "specificity": (
-        "how specific, detailed, and precise the prompt is. "
-        "A score of 5 means the prompt includes all necessary context, constraints, desired format, and scope. "
-        "A score of 1 means the prompt is extremely vague with no useful details."
-    ),
-    "ambiguity": (
-        "how free the prompt is from ambiguity or multiple interpretations. "
-        "A score of 5 means the prompt has exactly one clear interpretation. "
-        "A score of 1 means the prompt is highly ambiguous and could mean many different things."
-    ),
-    "tone": (
-        "how appropriate, professional, and effective the tone is for eliciting a high-quality AI response. "
-        "A score of 5 means the tone is ideal — polite, direct, and sets appropriate expectations. "
-        "A score of 1 means the tone is counterproductive, rude, or poorly framed."
-    ),
-}
-
-SCORE_SYSTEM_PROMPT = (
-    "You are an expert prompt-quality rater. "
-    "You rate a specific dimension of a prompt on a scale from 1 to 5, "
-    "where 1 is very poor and 5 is excellent. "
-    "Respond ONLY with the numeric score (e.g., 3.8). No explanation, no text, just the number."
 )
 
 
@@ -132,10 +166,15 @@ def run_optimize(prompt: str) -> str:
         ]
         for prefix in prefixes_to_strip:
             if text.lower().startswith(prefix.lower()):
-                text = text[len(prefix):].strip()
+                text = text[len(prefix) :].strip()
                 break
         text = text.replace("\n", " ").strip()
-        text = re.sub(r"\b(and|or|with|to|for|that|which|including)\s*[.:;!?]?$", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(
+            r"\b(and|or|with|to|for|that|which|including)\s*[.:;!?]?$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
         if text and text[-1] not in ".!?":
             last_full_stop = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
             if last_full_stop >= 20:
@@ -149,26 +188,40 @@ def run_optimize(prompt: str) -> str:
         return text
 
     def _rewrite_failure_reason(text, original):
-        """Return None if rewrite passes validation; otherwise a short reason code for logging."""
         t = text.lower().strip()
         o = original.lower().strip()
         if not t:
             return "empty_output"
         if t == o:
             return "unchanged_from_original"
-
-        # Meta wrappers / commentary means model didn't follow "output only rewrite".
         meta_prefixes = (
-            "here's", "here is", "rewritten:", "optimized:", "improved:",
-            "this prompt", "the rewritten prompt", "the optimized prompt",
+            "here's",
+            "here is",
+            "rewritten:",
+            "optimized:",
+            "improved:",
+            "this prompt",
+            "the rewritten prompt",
+            "the optimized prompt",
         )
         if t.startswith(meta_prefixes):
             return "meta_wrapper_or_commentary_prefix"
-
-        # Preserve original interaction form (question vs task).
         question_starts = (
-            "what", "how", "why", "when", "where", "which", "who",
-            "can", "could", "would", "should", "is", "are", "do", "does",
+            "what",
+            "how",
+            "why",
+            "when",
+            "where",
+            "which",
+            "who",
+            "can",
+            "could",
+            "would",
+            "should",
+            "is",
+            "are",
+            "do",
+            "does",
         )
         orig_is_question = o.endswith("?") or o.startswith(question_starts)
         rewrite_is_question = t.endswith("?") or t.startswith(question_starts)
@@ -177,26 +230,32 @@ def run_optimize(prompt: str) -> str:
                 "question_task_form_mismatch: "
                 f"original_is_question={orig_is_question}, rewrite_is_question={rewrite_is_question}"
             )
-
-        # Detect answer-like narrative openings (we want rewritten instructions).
         answer_like_starts = (
-            "to ", "first", "second", "third", "there are", "it is", "it's",
-            "this is", "in this", "the best way",
+            "to ",
+            "first",
+            "second",
+            "third",
+            "there are",
+            "it is",
+            "it's",
+            "this is",
+            "in this",
+            "the best way",
         )
         if t.startswith(answer_like_starts):
             for prefix in answer_like_starts:
                 if t.startswith(prefix):
                     return f"answer_like_opening:{prefix.strip()!r}"
             return "answer_like_opening"
-
-        # Common giveaway that model is explaining rather than rewriting.
         commentary_phrases = (
-            "this version", "this rewrite", "i rewrote", "maintains the same intent",
+            "this version",
+            "this rewrite",
+            "i rewrote",
+            "maintains the same intent",
         )
         for phrase in commentary_phrases:
             if phrase in t:
                 return f"commentary_phrase:{phrase!r}"
-
         word_count = len(t.split())
         if word_count < 10:
             return f"too_short:word_count={word_count}"
@@ -224,7 +283,6 @@ def run_optimize(prompt: str) -> str:
         (reply[:240] + "…") if len(reply) > 240 else reply,
     )
 
-    # Strict retry for malformed / answer-like / too-weak output.
     strict_messages = [
         {
             "role": "system",
@@ -253,54 +311,237 @@ def run_optimize(prompt: str) -> str:
         logger.info("[optimize] second pass passed validation")
     return retry
 
-def _parse_numeric_score(text: str) -> float:
-    """Extract a numeric score from model output, defaulting to 1.0–5.0 range."""
-    match = re.search(r"([-+]?\d+(\.\d+)?)", text)
-    if not match:
-        return 3.0
-    value = float(match.group(1))
-    return max(1.0, min(5.0, value))
 
-
-def _scale_to_100(score_1_to_5: float) -> int:
-    """Map a 1–5 score to an integer 0–100."""
-    return int(round((score_1_to_5 - 1.0) / 4.0 * 100))
-
-
-def run_score_dimension(prompt: str, dimension: str) -> int:
-    """Return a single dimension score scaled to 0–100."""
-    guideline = DIMENSION_GUIDELINES.get(dimension, f"the {dimension} of the prompt")
-    messages = [
-        {"role": "system", "content": SCORE_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Rate the following prompt on a 1 to 5 scale specifically for {guideline}\n\n"
-                f"Prompt: {prompt}"
-            ),
-        },
-    ]
+def _generate_with_score_model(
+    messages: list,
+    max_new_tokens: int,
+    *,
+    use_lora: bool,
+) -> str:
     input_text = score_tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = score_tokenizer(input_text, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = score_model.generate(
-            **inputs,
-            max_new_tokens=16,
-            do_sample=False,
-            repetition_penalty=1.05,
-            pad_token_id=score_tokenizer.eos_token_id,
-        )
+    gen_kw = dict(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        repetition_penalty=1.05,
+        pad_token_id=score_tokenizer.eos_token_id,
+    )
     input_len = inputs.input_ids.shape[1]
-    reply = score_tokenizer.decode(
-        outputs[0][input_len:], skip_special_tokens=True
-    ).strip()
-    for stop in ["<|im_end|>", "<|endoftext|>", "\n\n"]:
-        if stop in reply:
-            reply = reply.split(stop)[0].strip()
-    score_1_to_5 = _parse_numeric_score(reply)
-    return _scale_to_100(score_1_to_5)
+    with torch.no_grad():
+        if use_lora:
+            outputs = score_model.generate(**gen_kw)
+        else:
+            # Base weights only — explanations must not go through HelpSteer LoRA.
+            da = getattr(score_model, "disable_adapter", None)
+            if callable(da):
+                with da():
+                    outputs = score_model.generate(**gen_kw)
+            else:
+                logger.warning("[server] PeftModel.disable_adapter missing; using merged LoRA path for base call")
+                outputs = score_model.generate(**gen_kw)
+    return score_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+
+def _draft_assistant_reply(user_prompt: str, max_new_tokens: int = 128) -> str:
+    """Base weights only — hypothetical reply so HelpSteer-style scoring has a response."""
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Answer the user directly and concisely.",
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+    raw = _generate_with_score_model(messages, max_new_tokens, use_lora=False)
+    for stop in ["<|im_end|>", "<|endoftext|>"]:
+        if stop in raw:
+            raw = raw.split(stop)[0].strip()
+    return raw[:4000]
+
+
+def _parse_json_object(text: str) -> dict | None:
+    s = (text or "").strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        s = "\n".join(lines[1:])
+        if "```" in s:
+            s = s[: s.find("```")].strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    start, end = s.find("{"), s.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(s[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _is_prose_explanation_value(v) -> bool:
+    """True if model returned a real sentence, not an echoed numeric score."""
+    if v is None:
+        return False
+    if isinstance(v, (int, float, bool, list, dict)):
+        return False
+    s = str(v).strip()
+    if len(s) < 10:
+        return False
+    # Reject JSON values that are just numbers (model echoed the score).
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return False
+    # Reject "4/5" style
+    if re.fullmatch(r"\d\s*/\s*\d", s):
+        return False
+    letters = sum(1 for c in s if c.isalpha())
+    if letters < 8:
+        return False
+    return True
+
+
+def _fallback_explanation(dim: str, score: int) -> str:
+    """Deterministic copy when the small model returns non-prose JSON values."""
+    hints = {
+        "helpfulness": "how fully the draft answers what the user asked and whether next steps are clear.",
+        "correctness": "factual accuracy, missing caveats, and whether claims match the prompt.",
+        "coherence": "logical flow, clarity of sentences, and whether ideas connect cleanly.",
+        "complexity": "whether depth matches the task—too shallow or unnecessarily dense.",
+        "verbosity": "length versus need—padding, repetition, or leaving out useful detail.",
+    }
+    focus = hints.get(dim, "this aspect of the reply.")
+    if score <= 2:
+        qual = "is weak here; consider revising the draft with"
+    elif score == 3:
+        qual = "is middling; small edits could strengthen"
+    else:
+        qual = "is relatively strong; you might still polish"
+    return (
+        f"The draft {qual} {focus} "
+        f"(rated {score}/5 for {dim.replace('_', ' ')})."
+    )
+
+
+def _normalize_scores(obj: dict | None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not isinstance(obj, dict):
+        obj = {}
+    for k in HELPSTEER_DIMENSIONS:
+        v = obj.get(k)
+        try:
+            n = int(round(float(v)))
+        except (TypeError, ValueError):
+            n = 3
+        out[k] = max(1, min(5, n))
+    return out
+
+
+def _is_collapsed_scores(scores: dict[str, int]) -> bool:
+    vals = [scores[d] for d in HELPSTEER_DIMENSIONS]
+    return max(vals) - min(vals) == 0
+
+
+def _diversify_scores_if_collapsed(
+    user_prompt: str,
+    assistant_response: str,
+    scores: dict[str, int],
+) -> dict[str, int]:
+    """
+    If all dimensions collapse to one number (common with weak adapters), apply a
+    deterministic spread so UX can compare dimensions and prompts.
+    """
+    if not _is_collapsed_scores(scores):
+        return scores
+
+    base = scores[HELPSTEER_DIMENSIONS[0]]
+    text = f"{user_prompt}\n{assistant_response}"
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    # small prompt-shape heuristics for stable variation
+    length_boost = 1 if len(user_prompt.split()) >= 18 else 0
+    clarity_penalty = 1 if "??" in user_prompt or "idk" in user_prompt.lower() else 0
+    detail_boost = 1 if any(tok in user_prompt.lower() for tok in ["json", "table", "bullet", "format"]) else 0
+
+    out = {}
+    for i, dim in enumerate(HELPSTEER_DIMENSIONS):
+        jitter = (digest[i] % 3) - 1  # -1,0,+1
+        adj = base + jitter
+        if dim == "helpfulness":
+            adj += length_boost
+        elif dim == "coherence":
+            adj -= clarity_penalty
+        elif dim == "verbosity":
+            adj += detail_boost - length_boost
+        out[dim] = max(1, min(5, adj))
+    return out
+
+
+def run_helpsteer_json_rating(user_prompt: str, assistant_response: str) -> dict[str, int]:
+    user_block = (
+        "Rate the assistant response for the user prompt below.\n\n"
+        f"<user_prompt>\n{user_prompt}\n</user_prompt>\n\n"
+        f"<assistant_response>\n{assistant_response}\n</assistant_response>\n"
+    )
+    messages = [
+        {"role": "system", "content": RATER_SYSTEM},
+        {"role": "user", "content": user_block},
+    ]
+    raw = _generate_with_score_model(messages, max_new_tokens=200, use_lora=True)
+    parsed = _parse_json_object(raw)
+    if parsed is None:
+        logger.warning("[score_dims] failed to parse rater JSON; preview=%r", raw[:400])
+    scores = _normalize_scores(parsed)
+    scores = _diversify_scores_if_collapsed(user_prompt, assistant_response, scores)
+    return scores
+
+
+def run_base_explanations(
+    user_prompt: str,
+    draft_reply: str,
+    scores: dict[str, int],
+) -> dict[str, str]:
+    payload = json.dumps(scores, separators=(",", ":"), sort_keys=True)
+    user_block = (
+        f"<user_prompt>\n{user_prompt}\n</user_prompt>\n\n"
+        f"<assistant_response>\n{draft_reply}\n</assistant_response>\n\n"
+        f"<scores_json>\n{payload}\n</scores_json>\n"
+    )
+    messages = [
+        {"role": "system", "content": EXPLAIN_SYSTEM},
+        {"role": "user", "content": user_block},
+    ]
+    raw = _generate_with_score_model(messages, max_new_tokens=400, use_lora=False)
+    parsed = _parse_json_object(raw)
+    out: dict[str, str] = {}
+    if isinstance(parsed, dict):
+        for k in HELPSTEER_DIMENSIONS:
+            v = parsed.get(k)
+            if _is_prose_explanation_value(v):
+                out[k] = str(v).strip()
+            elif v is not None:
+                logger.info(
+                    "[explanations] ignored non-prose value for %s: %r",
+                    k,
+                    v if isinstance(v, str) else type(v).__name__,
+                )
+    for k in HELPSTEER_DIMENSIONS:
+        if k not in out:
+            out[k] = _fallback_explanation(k, scores.get(k, 3))
+    return out
+
+
+def run_score_pipeline(user_prompt: str, response_override: str | None) -> dict:
+    draft = (response_override or "").strip() or _draft_assistant_reply(user_prompt)
+    scores = run_helpsteer_json_rating(user_prompt, draft)
+    overall = int(round(sum(scores.values()) / len(scores)))
+    explanations = run_base_explanations(user_prompt, draft, scores)
+    return {
+        "overall": overall,
+        "scores": scores,
+        "explanations": explanations,
+        "draft_reply": draft,
+    }
 
 
 @app.route("/api/optimize", methods=["POST"])
@@ -312,6 +553,7 @@ def optimize():
     try:
         return jsonify({"optimized": run_optimize(prompt)})
     except Exception as e:
+        logger.exception("optimize failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -319,15 +561,16 @@ def optimize():
 def score_dims():
     data = request.get_json() or {}
     prompt = data.get("prompt", "").strip()
+    response_override = data.get("response")
+    if response_override is not None:
+        response_override = str(response_override).strip() or None
     if not prompt:
         return jsonify({"error": "No prompt provided"}), 400
     try:
-        dims = ["clarity", "specificity", "ambiguity", "tone"]
-        scores = {dim: run_score_dimension(prompt, dim) for dim in dims}
-        # Overall is the average of all dimension scores
-        overall = round(sum(scores.values()) / len(scores))
-        return jsonify({"overall": overall, "scores": scores})
+        result = run_score_pipeline(prompt, response_override)
+        return jsonify(result)
     except Exception as e:
+        logger.exception("score_dims failed")
         return jsonify({"error": str(e)}), 500
 
 
