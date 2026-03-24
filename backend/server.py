@@ -119,6 +119,11 @@ score_model = PeftModel.from_pretrained(_base_score, _score_adapter_path)
 score_model.to(device)
 score_model.eval()
 
+print(f"[server] Loading base generation model from {BASE_MODEL_ID}...")
+_base_generate = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, dtype=dtype)
+base_model = _base_generate.to(device)
+base_model.eval()
+
 print("[server] All models ready.")
 
 OPTIMIZE_SYSTEM_PROMPT = (
@@ -134,6 +139,20 @@ OPTIMIZE_SYSTEM_PROMPT = (
     "7. Include at least two concrete constraints (for example scope, audience, length, criteria) and an explicit output format hint.\n"
     "8. Never start with 'Rewritten:', 'Optimized:', or any label."
 )
+
+TASK_TO_PROMPT_SYSTEM = (
+    "You are a prompt generation assistant. Convert a user's task, idea, or project request into "
+    "one polished prompt that can be pasted into an AI system.\n\n"
+    "STRICT RULES — follow all of them:\n"
+    "1. Output ONLY the final prompt. No explanation, no title, no markdown.\n"
+    "2. Preserve the user's goal exactly. Do not invent a different task.\n"
+    "3. Make the prompt specific, structured, and directly usable.\n"
+    "4. Include clear instructions, constraints, and an explicit output format when helpful.\n"
+    "5. If the user mentions a domain, language, framework, audience, or style, keep it.\n"
+    "6. Keep the prompt under 170 words.\n"
+    "7. Do not answer the task yourself; only write the prompt that should be given to another AI."
+)
+
 
 
 def run_optimize(prompt: str) -> str:
@@ -310,6 +329,51 @@ def run_optimize(prompt: str) -> str:
     else:
         logger.info("[optimize] second pass passed validation")
     return retry
+
+
+def run_task_to_prompt(task_or_idea: str) -> str:
+    messages = [
+        {"role": "system", "content": TASK_TO_PROMPT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                "Turn this task or idea into one strong, ready-to-use prompt for an AI assistant: "
+                f"{task_or_idea}"
+            ),
+        },
+    ]
+    input_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(input_text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = base_model.generate(
+            **inputs,
+            max_new_tokens=220,
+            do_sample=False,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    input_len = inputs.input_ids.shape[1]
+    text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    for stop in ["<|im_end|>", "<|endoftext|>"]:
+        if stop in text:
+            text = text.split(stop)[0].strip()
+    prefixes_to_strip = [
+        "Prompt:",
+        "Generated prompt:",
+        "Here is a prompt:",
+        "Here's a prompt:",
+        "Final prompt:",
+    ]
+    for prefix in prefixes_to_strip:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+            break
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
 
 
 def _generate_with_score_model(
@@ -571,6 +635,19 @@ def score_dims():
         return jsonify(result)
     except Exception as e:
         logger.exception("score_dims failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/generate_task_prompt", methods=["POST"])
+def generate_task_prompt():
+    data = request.get_json() or {}
+    task = data.get("prompt", "").strip()
+    if not task:
+        return jsonify({"error": "No prompt provided"}), 400
+    try:
+        return jsonify({"generated_prompt": run_task_to_prompt(task)})
+    except Exception as e:
+        logger.exception("generate_task_prompt failed")
         return jsonify({"error": str(e)}), 500
 
 
