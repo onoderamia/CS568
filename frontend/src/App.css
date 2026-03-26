@@ -346,6 +346,23 @@ body {
   padding-top: 2px;
 }
 
+.dimension-card__bullets {
+  margin: 0;
+  padding: 2px 0 0 1.15rem;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.dimension-card__bullet {
+  margin: 0 0 0.45em 0;
+  padding-left: 0.15rem;
+}
+
+.dimension-card__bullet:last-child {
+  margin-bottom: 0;
+}
+
 /* ── Draft reply disclosure ── */
 
 .draft-details {

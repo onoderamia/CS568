@@ -5,3 +5,5 @@ peft
 torch
 flask
 flask-cors
+google-genai
+python-dotenv

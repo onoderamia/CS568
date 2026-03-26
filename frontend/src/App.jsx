@@ -47,6 +47,31 @@ function ScoreBarFive({ dimKey, value, color }) {
   );
 }
 
+function DimensionFeedbackBody({ text }) {
+  if (!text || !String(text).trim()) {
+    return <p className="dimension-card__feedback">—</p>;
+  }
+  const lines = String(text)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const bulletLines = lines.filter(
+    (l) => l.startsWith("- ") || l.startsWith("• "),
+  );
+  if (bulletLines.length >= 1) {
+    return (
+      <ul className="dimension-card__bullets">
+        {bulletLines.map((l, i) => (
+          <li key={i} className="dimension-card__bullet">
+            {l.replace(/^[-•]\s+/, "")}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return <p className="dimension-card__feedback">{text}</p>;
+}
+
 function DimensionFeedbackCard({ dimKey, score, explanation, color }) {
   const label = DIMENSION_LABELS[dimKey] || dimKey;
   return (
@@ -58,7 +83,7 @@ function DimensionFeedbackCard({ dimKey, score, explanation, color }) {
           <span className="dimension-card__badge-denom">/5</span>
         </span>
       </header>
-      <p className="dimension-card__feedback">{explanation || "—"}</p>
+      <DimensionFeedbackBody text={explanation} />
     </article>
   );
 }
@@ -104,8 +129,8 @@ function CheckResult({ msg }) {
           <div className="result-section">
             <h3 className="section-title">Quality scores (1–5)</h3>
             <p className="section-hint">
-              Scores rate a brief AI draft of your prompt (same setup as
-              training). Explanations come from the base model.
+              Scores reflect your prompt's quality across key dimensions.
+              Feedback explains why it scored that way and how to improve it.
             </p>
             {orderedDims.map((key) => (
               <ScoreBarFive
@@ -225,7 +250,7 @@ function Thinking() {
 
 const WELCOME = {
   check:
-    "Paste your prompt and I'll score a quick AI draft on helpfulness, correctness, coherence, complexity, and verbosity (1–5), explain each with the base model, then show an optimized prompt.",
+    "Paste your prompt and I'll score it on helpfulness, correctness, coherence, complexity, and verbosity (1–5), explain why your prompt received each score, then show an optimized version.",
   generate:
     "Describe your idea, task, or project request and I'll turn it into a polished, ready-to-use prompt.",
 };

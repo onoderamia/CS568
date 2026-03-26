@@ -7,7 +7,7 @@ Endpoints:
   POST /api/score_dims     { "prompt": "...", "response"?: "..." }  ->  {
                               "overall": 1-5 (int, mean of dimensions),
                               "scores": { helpfulness, correctness, coherence, complexity, verbosity },
-                              "explanations": { same keys -> short strings },
+                              "explanations": { same keys -> bullet lines (Gemini JSON or fallback) },
                               "draft_reply": optional assistant draft used for scoring
                             }
 """
@@ -19,6 +19,11 @@ import json
 import logging
 import os
 import re
+import time
+
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # Prevent transformers from trying to import TensorFlow/JAX backends
 os.environ["USE_TF"] = "0"
@@ -28,6 +33,8 @@ os.environ["TRANSFORMERS_NO_TF"] = "1"
 import torch
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from google import genai
+from google.genai import errors as genai_errors
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -62,18 +69,6 @@ RATER_SYSTEM = (
     "complexity = intellectual depth appropriate to the task; "
     "verbosity = appropriate detail without excess padding."
 )
-
-EXPLAIN_SYSTEM = (
-    "You write concise feedback for a draft assistant reply. "
-    "You receive the user prompt, the draft reply, and integer scores 1–5 for: "
-    "helpfulness, correctness, coherence, complexity, verbosity. "
-    "Output ONE JSON object with exactly those five keys. "
-    "CRITICAL: each value MUST be a JSON string in double quotes — a full English sentence (10+ words). "
-    "Never use a bare number as a value (wrong: \"helpfulness\":4). "
-    "Right: \"helpfulness\":\"The reply addresses the request but could be more actionable.\" "
-    "Do not repeat the numeric score in the sentence. No markdown, no code fences."
-)
-
 
 def _pick_device() -> str:
     if torch.cuda.is_available():
@@ -126,6 +121,35 @@ base_model.eval()
 
 print("[server] All models ready.")
 
+# ── Gemini client ──
+_gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+_gemini_client: genai.Client | None = None
+if _gemini_api_key and _gemini_api_key != "your-gemini-api-key-here":
+    _gemini_client = genai.Client(api_key=_gemini_api_key)
+    print("[server] Gemini client initialized.")
+else:
+    print("[server] GEMINI_API_KEY not set — feedback cards will use SmolLM fallback.")
+
+GEMINI_FEEDBACK_MODEL = os.environ.get("GEMINI_FEEDBACK_MODEL", "gemini-2.5-flash")
+
+GEMINI_EXPLAIN_PROMPT = """\
+You evaluate the quality of a user's **prompt** (the instruction for an AI). Do NOT evaluate any model response.
+
+User's prompt:
+\"\"\"{user_prompt}\"\"\"
+
+Dimension scores (1=worst, 5=best):
+{score_block}
+
+Return **one JSON object only** — no markdown, no code fences, no text before or after.
+Keys must be exactly: helpfulness, correctness, coherence, complexity, verbosity.
+Each value must be an **array of 2 or 3 strings**. Each string is one bullet sentence explaining why that score fits this prompt and how to improve it.
+Focus on clarity, specificity, constraints, format, audience, and scope of the prompt.
+
+Example shape (replace with real content):
+{{"helpfulness":["...","..."],"correctness":["...","..."],"coherence":["...","..."],"complexity":["...","..."],"verbosity":["...","..."]}}
+"""
+
 OPTIMIZE_SYSTEM_PROMPT = (
     "You are a prompt optimization assistant. Your sole task is to rewrite the user's prompt "
     "to be clearer, more specific, and more effective for AI systems.\n\n"
@@ -137,7 +161,8 @@ OPTIMIZE_SYSTEM_PROMPT = (
     "5. Keep the rewritten prompt under 110 words and aim for 2-3 sentences.\n"
     "6. Improve: specificity, clarity, context, role framing, and actionability.\n"
     "7. Include at least two concrete constraints (for example scope, audience, length, criteria) and an explicit output format hint.\n"
-    "8. Never start with 'Rewritten:', 'Optimized:', or any label."
+    "8. Never start with 'Rewritten:', 'Optimized:', or any label.\n"
+    "9. Never begin with 'Here's' or 'Here is' or wrap the rewrite in quotation marks—output the prompt as plain text only."
 )
 
 TASK_TO_PROMPT_SYSTEM = (
@@ -153,6 +178,41 @@ TASK_TO_PROMPT_SYSTEM = (
     "7. Do not answer the task yourself; only write the prompt that should be given to another AI."
 )
 
+
+def _strip_optimize_meta_wrapper(text: str) -> str:
+    """
+    BPO SmolLM often returns meta text plus a quoted rewrite (e.g. 'Here is a revised version…: "Please …" I have…').
+    Peel wrappers so only the rewritten prompt remains.
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    here_colon = re.compile(r"(?is)^here(?:'s| is)\s+.+?:\s*")
+    for _ in range(6):
+        m = here_colon.match(s)
+        if not m:
+            break
+        s = s[m.end() :].strip()
+
+    label_colon = re.compile(
+        r"(?is)^(?:a\s+)?revised\s+version\s+of\s+(?:the\s+)?(?:original\s+)?prompt\s*:\s*"
+    )
+    for _ in range(3):
+        m = label_colon.match(s)
+        if not m:
+            break
+        s = s[m.end() :].strip()
+
+    # Double-quoted rewrite: keep inside first pair only (drops trailing 'I have…' commentary).
+    if len(s) >= 2 and s.startswith('"'):
+        end = s.find('"', 1)
+        if end > 1:
+            inner = s[1:end].strip()
+            if len(inner) >= 6:
+                s = inner
+
+    return s.strip()
 
 
 def run_optimize(prompt: str) -> str:
@@ -176,6 +236,7 @@ def run_optimize(prompt: str) -> str:
         for stop in ["<|im_end|>", "<|endoftext|>"]:
             if stop in text:
                 text = text.split(stop)[0].strip()
+        text = _strip_optimize_meta_wrapper(text)
         prefixes_to_strip = [
             "Here's an optimized version of your prompt:",
             "Here's a rewritten version:",
@@ -194,6 +255,12 @@ def run_optimize(prompt: str) -> str:
             text,
             flags=re.IGNORECASE,
         ).strip()
+        jl = text.lower()
+        for junk in (" i have ", " i also ", " finally,", " i've ", " i rephrased"):
+            j = jl.find(junk)
+            if j >= 25:
+                text = text[:j].strip()
+                jl = text.lower()
         if text and text[-1] not in ".!?":
             last_full_stop = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
             if last_full_stop >= 20:
@@ -441,29 +508,20 @@ def _parse_json_object(text: str) -> dict | None:
         try:
             return json.loads(s[start : end + 1])
         except json.JSONDecodeError:
-            return None
+            pass
+
+    # Rater sometimes returns "1. Helpfulness: 3" instead of JSON
+    pairs = re.findall(
+        r"(?:^|\n)\s*\d*[.)]*\s*(\w+)\s*[:=]\s*(\d)",
+        s,
+        re.IGNORECASE,
+    )
+    if pairs:
+        result = {k.lower().strip(): int(v) for k, v in pairs}
+        if any(k in result for k in HELPSTEER_DIMENSIONS):
+            return result
+
     return None
-
-
-def _is_prose_explanation_value(v) -> bool:
-    """True if model returned a real sentence, not an echoed numeric score."""
-    if v is None:
-        return False
-    if isinstance(v, (int, float, bool, list, dict)):
-        return False
-    s = str(v).strip()
-    if len(s) < 10:
-        return False
-    # Reject JSON values that are just numbers (model echoed the score).
-    if re.fullmatch(r"-?\d+(\.\d+)?", s):
-        return False
-    # Reject "4/5" style
-    if re.fullmatch(r"\d\s*/\s*\d", s):
-        return False
-    letters = sum(1 for c in s if c.isalpha())
-    if letters < 8:
-        return False
-    return True
 
 
 def _fallback_explanation(dim: str, score: int) -> str:
@@ -560,38 +618,143 @@ def run_helpsteer_json_rating(user_prompt: str, assistant_response: str) -> dict
     return scores
 
 
+def _bullets_from_gemini_value(v) -> str:
+    """Turn a JSON array of strings (or one string) into '- line\\n' text for the UI."""
+    parts: list[str] = []
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v if str(x).strip()]
+    elif isinstance(v, str) and v.strip():
+        parts = [p.strip() for p in re.split(r"[\n\r]+", v) if p.strip()]
+    out_lines: list[str] = []
+    for p in parts:
+        p = re.sub(r"^[-•*]\s*", "", p)
+        if p:
+            out_lines.append("- " + p)
+    return "\n".join(out_lines[:5])
+
+
+def _parse_gemini_feedback_json(raw: str) -> dict[str, str] | None:
+    """Parse single JSON object from Gemini into per-dimension bullet strings."""
+    parsed = _parse_json_object(raw)
+    if not isinstance(parsed, dict):
+        return None
+    out: dict[str, str] = {}
+    for dim in HELPSTEER_DIMENSIONS:
+        text = _bullets_from_gemini_value(parsed.get(dim))
+        n = sum(1 for line in text.splitlines() if line.strip().startswith("-"))
+        if n >= 1:
+            out[dim] = text
+    return out if out else None
+
+
+def _gemini_is_rate_limit(exc: BaseException) -> bool:
+    if isinstance(exc, genai_errors.ClientError):
+        return getattr(exc, "code", None) == 429
+    return "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+
+
+def _gemini_quota_zero_or_billing(exc: BaseException) -> bool:
+    """
+    True when Google reports no free-tier quota for this model (limit: 0).
+    Retrying will not help — fix API key, project, billing, or GEMINI_FEEDBACK_MODEL.
+    """
+    msg = str(exc).lower()
+    return "limit: 0" in msg and "free_tier" in msg
+
+
+def _run_gemini_explanations(
+    user_prompt: str,
+    scores: dict[str, int],
+) -> dict[str, str] | None:
+    """One Gemini call → JSON with all dimensions → bullet strings per card."""
+    if _gemini_client is None:
+        return None
+
+    score_block = "\n".join(
+        f"  {dim.replace('_', ' ').upper()}: {scores.get(dim, 3)}/5"
+        for dim in HELPSTEER_DIMENSIONS
+    )
+    prompt_text = GEMINI_EXPLAIN_PROMPT.format(
+        user_prompt=user_prompt,
+        score_block=score_block,
+    )
+
+    max_attempts = int(os.environ.get("GEMINI_FEEDBACK_MAX_RETRIES", "4"))
+    base_delay = float(os.environ.get("GEMINI_FEEDBACK_RETRY_BASE_S", "2.0"))
+
+    raw = ""
+    for attempt in range(max_attempts):
+        try:
+            response = _gemini_client.models.generate_content(
+                model=GEMINI_FEEDBACK_MODEL,
+                contents=prompt_text,
+            )
+            raw = (response.text or "").strip()
+            break
+        except Exception as e:
+            if _gemini_quota_zero_or_billing(e):
+                logger.error(
+                    "[explanations] Gemini model %r has no usable quota for this API key/project "
+                    "(Google returns free-tier limit 0 — not a 'too many requests' issue). "
+                    "Fix: enable billing in Google AI Studio / Cloud, or set GEMINI_FEEDBACK_MODEL to a model "
+                    "your project can use. Docs: https://ai.google.dev/gemini-api/docs/rate-limits",
+                    GEMINI_FEEDBACK_MODEL,
+                )
+                return None
+            if _gemini_is_rate_limit(e) and attempt < max_attempts - 1:
+                delay = base_delay * (2**attempt)
+                logger.warning(
+                    "[explanations] Gemini rate limited (429); retry in %.1fs (%d/%d)",
+                    delay,
+                    attempt + 1,
+                    max_attempts,
+                )
+                time.sleep(delay)
+                continue
+            logger.exception("[explanations] Gemini call failed")
+            return None
+
+    if not raw:
+        logger.warning("[explanations] Gemini returned empty text")
+        return None
+
+    parsed = _parse_gemini_feedback_json(raw)
+    if parsed and len(parsed) == len(HELPSTEER_DIMENSIONS):
+        logger.info("[explanations] Gemini JSON parsed for all %d dimensions", len(parsed))
+        return parsed
+
+    if parsed:
+        logger.warning(
+            "[explanations] Gemini JSON incomplete (%d/%d dimensions); partial merge + fallback",
+            len(parsed),
+            len(HELPSTEER_DIMENSIONS),
+        )
+        return parsed
+
+    logger.warning("[explanations] Gemini JSON parse failed; preview=%r", raw[:500])
+    return None
+
+
 def run_base_explanations(
     user_prompt: str,
     draft_reply: str,
     scores: dict[str, int],
 ) -> dict[str, str]:
-    payload = json.dumps(scores, separators=(",", ":"), sort_keys=True)
-    user_block = (
-        f"<user_prompt>\n{user_prompt}\n</user_prompt>\n\n"
-        f"<assistant_response>\n{draft_reply}\n</assistant_response>\n\n"
-        f"<scores_json>\n{payload}\n</scores_json>\n"
-    )
-    messages = [
-        {"role": "system", "content": EXPLAIN_SYSTEM},
-        {"role": "user", "content": user_block},
-    ]
-    raw = _generate_with_score_model(messages, max_new_tokens=400, use_lora=False)
-    parsed = _parse_json_object(raw)
+    """Use Gemini for prompt-focused feedback, fall back to SmolLM base model."""
+    gemini_result = _run_gemini_explanations(user_prompt, scores)
+
     out: dict[str, str] = {}
-    if isinstance(parsed, dict):
-        for k in HELPSTEER_DIMENSIONS:
-            v = parsed.get(k)
-            if _is_prose_explanation_value(v):
-                out[k] = str(v).strip()
-            elif v is not None:
-                logger.info(
-                    "[explanations] ignored non-prose value for %s: %r",
-                    k,
-                    v if isinstance(v, str) else type(v).__name__,
-                )
-    for k in HELPSTEER_DIMENSIONS:
-        if k not in out:
-            out[k] = _fallback_explanation(k, scores.get(k, 3))
+    if gemini_result:
+        out.update(gemini_result)
+
+    missing = [d for d in HELPSTEER_DIMENSIONS if d not in out]
+    if not missing:
+        return out
+
+    if missing:
+        logger.info("[explanations] filling %d dimensions with SmolLM fallback: %s", len(missing), missing)
+    for k in missing:
+        out[k] = _fallback_explanation(k, scores.get(k, 3))
     return out
 
 
