@@ -7,7 +7,7 @@ Endpoints:
   POST /api/score_dims     { "prompt": "...", "response"?: "..." }  ->  {
                               "overall": 1-5 (int, mean of dimensions),
                               "scores": { helpfulness, correctness, coherence, complexity, verbosity },
-                              "explanations": { same keys -> bullet lines (Gemini JSON or fallback) },
+                              "explanations": { same keys -> text (Gemini when GEMINI_FEEDBACK_ENABLED, else default) },
                               "draft_reply": optional assistant draft used for scoring
                             }
 """
@@ -128,9 +128,26 @@ if _gemini_api_key and _gemini_api_key != "your-gemini-api-key-here":
     _gemini_client = genai.Client(api_key=_gemini_api_key)
     print("[server] Gemini client initialized.")
 else:
-    print("[server] GEMINI_API_KEY not set — feedback cards will use SmolLM fallback.")
+    print("[server] GEMINI_API_KEY not set — Gemini feedback calls cannot run.")
 
 GEMINI_FEEDBACK_MODEL = os.environ.get("GEMINI_FEEDBACK_MODEL", "gemini-2.5-flash")
+
+
+def _gemini_feedback_enabled() -> bool:
+    """
+    When True, explanation bullets are generated via Gemini (one API call per score_dims).
+    When False (default), use _fallback_explanation only — no Gemini HTTP requests.
+
+    Set GEMINI_FEEDBACK_ENABLED=1 (or true/yes/on) in backend/.env to enable.
+    """
+    v = os.environ.get("GEMINI_FEEDBACK_ENABLED", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+if _gemini_feedback_enabled():
+    print("[server] GEMINI_FEEDBACK_ENABLED: feedback cards will call Gemini.")
+else:
+    print("[server] GEMINI_FEEDBACK_ENABLED off: feedback cards use default text only.")
 
 GEMINI_EXPLAIN_PROMPT = """\
 You evaluate the quality of a user's **prompt** (the instruction for an AI). Do NOT evaluate any model response.
@@ -740,20 +757,26 @@ def run_base_explanations(
     draft_reply: str,
     scores: dict[str, int],
 ) -> dict[str, str]:
-    """Use Gemini for prompt-focused feedback, fall back to SmolLM base model."""
-    gemini_result = _run_gemini_explanations(user_prompt, scores)
-
+    """Gemini bullets when GEMINI_FEEDBACK_ENABLED; otherwise default _fallback_explanation text."""
     out: dict[str, str] = {}
-    if gemini_result:
-        out.update(gemini_result)
 
-    missing = [d for d in HELPSTEER_DIMENSIONS if d not in out]
-    if not missing:
+    if _gemini_feedback_enabled():
+        gemini_result = _run_gemini_explanations(user_prompt, scores)
+        if gemini_result:
+            out.update(gemini_result)
+        missing = [d for d in HELPSTEER_DIMENSIONS if d not in out]
+        if missing:
+            logger.info(
+                "[explanations] filling %d dimensions with default fallback: %s",
+                len(missing),
+                missing,
+            )
+            for k in missing:
+                out[k] = _fallback_explanation(k, scores.get(k, 3))
         return out
 
-    if missing:
-        logger.info("[explanations] filling %d dimensions with SmolLM fallback: %s", len(missing), missing)
-    for k in missing:
+    logger.info("[explanations] Gemini disabled (GEMINI_FEEDBACK_ENABLED); default feedback for all dimensions")
+    for k in HELPSTEER_DIMENSIONS:
         out[k] = _fallback_explanation(k, scores.get(k, 3))
     return out
 
