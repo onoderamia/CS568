@@ -4,6 +4,8 @@ Runs on http://localhost:5001
 
 Endpoints:
   POST /api/optimize       { "prompt": "..." }  ->  { "optimized": "..." }
+  POST /api/refine_optimized  { "mode": "sentence"|"full", "original_user_prompt", "full_optimized",
+                              "initial_optimized"?, "sentence_index", "action" }  ->  { "optimized": "..." }
   POST /api/score_dims     { "prompt": "...", "response"?: "..." }  ->  {
                               "overall": 1-5 (int, mean of dimensions),
                               "scores": { helpfulness, correctness, coherence, complexity, verbosity },
@@ -232,64 +234,332 @@ def _strip_optimize_meta_wrapper(text: str) -> str:
     return s.strip()
 
 
-def run_optimize(prompt: str) -> str:
-    def _generate(messages, max_new_tokens=140):
-        input_text = opt_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+
+def _cleanup_optimized_output(text: str) -> str:
+    """Normalize BPO optimizer output (shared by run_optimize and refine endpoints)."""
+    for stop in ["<|im_end|>", "<|endoftext|>"]:
+        if stop in text:
+            text = text.split(stop)[0].strip()
+    text = _strip_optimize_meta_wrapper(text)
+    prefixes_to_strip = [
+        "Here's an optimized version of your prompt:",
+        "Here's a rewritten version:",
+        "Here's the optimized prompt:",
+        "Rewritten:", "Optimized:", "Improved:", "Result:",
+        "Optimized prompt:", "Rewritten prompt:",
+    ]
+    for prefix in prefixes_to_strip:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix) :].strip()
+            break
+    text = text.replace("\n", " ").strip()
+    text = re.sub(
+        r"\b(and|or|with|to|for|that|which|including)\s*[.:;!?]?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    jl = text.lower()
+    for junk in (" i have ", " i also ", " finally,", " i've ", " i rephrased"):
+        j = jl.find(junk)
+        if j >= 25:
+            text = text[:j].strip()
+            jl = text.lower()
+    if text and text[-1] not in ".!?":
+        last_full_stop = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+        if last_full_stop >= 20:
+            text = text[: last_full_stop + 1].strip()
+        else:
+            text = f"{text}."
+    if text.count('"') % 2 == 1:
+        text += '"'
+    if text.count("(") > text.count(")"):
+        text += ")" * (text.count("(") - text.count(")"))
+    return text
+
+
+def _generate_opt_bpo(messages: list, max_new_tokens: int = 140) -> str:
+    input_text = opt_tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = opt_tokenizer(input_text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = opt_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            repetition_penalty=1.15,
+            pad_token_id=opt_tokenizer.eos_token_id,
         )
-        inputs = opt_tokenizer(input_text, return_tensors="pt").to(device)
-        with torch.no_grad():
-            outputs = opt_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                repetition_penalty=1.15,
-                pad_token_id=opt_tokenizer.eos_token_id,
-            )
-        input_len = inputs.input_ids.shape[1]
-        return opt_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    input_len = inputs.input_ids.shape[1]
+    return opt_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
-    def _cleanup(text):
-        for stop in ["<|im_end|>", "<|endoftext|>"]:
-            if stop in text:
-                text = text.split(stop)[0].strip()
-        text = _strip_optimize_meta_wrapper(text)
-        prefixes_to_strip = [
-            "Here's an optimized version of your prompt:",
-            "Here's a rewritten version:",
-            "Here's the optimized prompt:",
-            "Rewritten:", "Optimized:", "Improved:", "Result:",
-            "Optimized prompt:", "Rewritten prompt:",
-        ]
-        for prefix in prefixes_to_strip:
-            if text.lower().startswith(prefix.lower()):
-                text = text[len(prefix) :].strip()
-                break
-        text = text.replace("\n", " ").strip()
-        text = re.sub(
-            r"\b(and|or|with|to|for|that|which|including)\s*[.:;!?]?$",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip()
-        jl = text.lower()
-        for junk in (" i have ", " i also ", " finally,", " i've ", " i rephrased"):
-            j = jl.find(junk)
-            if j >= 25:
-                text = text[:j].strip()
-                jl = text.lower()
-        if text and text[-1] not in ".!?":
-            last_full_stop = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
-            if last_full_stop >= 20:
-                text = text[: last_full_stop + 1].strip()
-            else:
-                text = f"{text}."
-        if text.count('"') % 2 == 1:
-            text += '"'
-        if text.count("(") > text.count(")"):
-            text += ")" * (text.count("(") - text.count(")"))
-        return text
 
+def _split_into_sentences(text: str) -> list[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _sentence_similarity(a: str, b: str) -> float:
+    """Word-overlap ratio (Jaccard) between two sentences, 0..1."""
+    wa = set(a.lower().split())
+    wb = set(b.lower().split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def _generate_opt_bpo_sampled(
+    messages: list, max_new_tokens: int = 140, temperature: float = 0.7,
+) -> str:
+    """Like _generate_opt_bpo but with sampling enabled for more varied output."""
+    input_text = opt_tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = opt_tokenizer(input_text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = opt_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            pad_token_id=opt_tokenizer.eos_token_id,
+        )
+    input_len = inputs.input_ids.shape[1]
+    return opt_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+
+def _cleanup_refined_sentence(raw: str, original_sentence: str, user_prompt: str) -> str:
+    """
+    Lighter cleanup for single-sentence refinement output.
+    Unlike _cleanup_optimized_output (designed for full prompts), this avoids
+    aggressive truncation that would destroy valid sentence-level edits.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return original_sentence
+
+    for stop in ["<|im_end|>", "<|endoftext|>"]:
+        if stop in text:
+            text = text.split(stop)[0].strip()
+
+    text = text.replace("\n", " ").strip()
+
+    prefixes_to_strip = [
+        "Here's an optimized version of your prompt:",
+        "Here's a rewritten version:",
+        "Here's the optimized prompt:",
+        "Here's the rephrased instruction:",
+        "Here's the shortened version:",
+        "Here's the expanded version:",
+        "Rewritten:", "Optimized:", "Improved:", "Result:",
+        "Rephrased:", "Shortened:", "Expanded:", "Revised:",
+        "Optimized prompt:", "Rewritten prompt:",
+        "Rephrased instruction:", "Shortened instruction:",
+        "Here is the revised instruction:",
+        "Here is the rephrased instruction:",
+    ]
+    for prefix in prefixes_to_strip:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix) :].strip()
+            break
+
+    if len(text) >= 2 and text.startswith('"'):
+        end = text.find('"', 1)
+        if end > 1:
+            inner = text[1:end].strip()
+            if len(inner) >= 6:
+                text = inner
+
+    commentary_markers = (" I have ", " I also ", " I've ", " I rephrased", " This version ")
+    for marker in commentary_markers:
+        idx = text.find(marker)
+        if idx >= 15:
+            text = text[:idx].strip()
+
+    tail_labels = re.compile(
+        r"\s*(?:Output|Result|Additional constraint|Note|Constraint)\s*:\s*[\"'].*$",
+        re.IGNORECASE,
+    )
+    text = tail_labels.sub("", text).strip()
+
+    sents = re.split(r"(?<=[.!?])\s+", text)
+    if len(sents) >= 2:
+        seen_lower = set()
+        deduped = []
+        for s in sents:
+            norm = s.lower().strip().rstrip(".")
+            if norm not in seen_lower:
+                seen_lower.add(norm)
+                deduped.append(s)
+        text = " ".join(deduped)
+
+    if text and text[-1] not in ".!?":
+        text = f"{text}."
+
+    if text.count('"') % 2 == 1:
+        text += '"'
+
+    if not text or len(text) < 5:
+        return original_sentence
+
+    return text
+
+
+def run_refine_optimized_sentence(
+    full_optimized: str,
+    sentence_index: int,
+    action: str,
+    original_user_prompt: str,
+) -> str:
+    sentences = _split_into_sentences(full_optimized)
+    if not sentences or sentence_index < 0 or sentence_index >= len(sentences):
+        raise ValueError("invalid sentence_index for this prompt")
+    if action not in ("elaborate", "concise"):
+        raise ValueError("action must be elaborate or concise")
+    target = sentences[sentence_index]
+    other_sentences = " ".join(s for j, s in enumerate(sentences) if j != sentence_index)
+
+    if action == "elaborate":
+        system = (
+            "You are a prompt editor. You add constraints, formatting requirements, or scope details "
+            "to a single instruction sentence. You NEVER answer, explain, or discuss the topic. "
+            "You NEVER provide information, facts, or content about the subject matter. "
+            "You ONLY add prompt-engineering details like: expected output format, length constraints, "
+            "audience, scope boundaries, what to include or exclude, or evaluation criteria.\n\n"
+            "STRICT RULES:\n"
+            "1. Output ONLY the improved instruction sentence (1-2 sentences max).\n"
+            "2. Do NOT answer or explain the topic in any way.\n"
+            "3. Do NOT mention 'the user' or use personal pronouns (I, we, us, my, our, you, your).\n"
+            "4. Do NOT repeat or rephrase any other sentence from the prompt.\n"
+            "5. No labels, no quotes, no preamble, no commentary."
+        )
+        user_content = (
+            f"This is one instruction sentence from a prompt:\n{target}\n\n"
+            "Add prompt-engineering details to this sentence — such as output format, "
+            "scope limits, what to include/exclude, length, or audience. "
+            "Do NOT answer the topic. Do NOT provide facts or explanations about the subject. "
+            "Only add instructions that tell an AI HOW to respond.\n\n"
+            "Do NOT repeat or rephrase these other sentences (they already exist in the prompt):\n"
+            + other_sentences
+        )
+        mt = 150
+    else:
+        system = (
+            "You shorten sentences. Given one sentence, output a shorter version with the same meaning. "
+            "Remove filler words and redundant phrases. Do NOT add new content or extra sentences. "
+            "Do NOT answer or explain the topic. "
+            "Do NOT use personal pronouns (I, we, us, my, our, you, your). "
+            "The output MUST be shorter than the input. Output ONLY one sentence."
+        )
+        user_content = (
+            f"Make this sentence shorter (remove filler, keep meaning):\n\n"
+            f"{target}\n\n"
+            "Shorter version:"
+        )
+        mt = 60
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+    raw = _generate_opt_bpo_sampled(messages, max_new_tokens=mt)
+    logger.info("[refine] raw output: %r", raw[:300] if len(raw) > 300 else raw)
+    new_sentence = _cleanup_refined_sentence(raw, target, original_user_prompt)
+    logger.info("[refine] cleaned: %r", new_sentence[:200] if len(new_sentence) > 200 else new_sentence)
+
+    def _is_bad(candidate, orig, act):
+        if not candidate:
+            return True
+        if candidate.lower().strip(". ") == orig.lower().strip(". "):
+            return True
+        if act == "concise" and len(candidate.split()) >= len(orig.split()):
+            return True
+        return False
+
+    if _is_bad(new_sentence, target, action):
+        logger.info("[refine] first attempt rejected, retrying with temperature=0.95")
+        raw = _generate_opt_bpo_sampled(messages, max_new_tokens=mt, temperature=0.95)
+        logger.info("[refine] retry raw: %r", raw[:300] if len(raw) > 300 else raw)
+        new_sentence = _cleanup_refined_sentence(raw, target, original_user_prompt)
+        logger.info("[refine] retry cleaned: %r", new_sentence[:200] if len(new_sentence) > 200 else new_sentence)
+
+    if action == "concise" and _is_bad(new_sentence, target, action):
+        logger.info("[refine] concise still too long, trimming programmatically")
+        words = target.split()
+        cut = max(len(words) * 2 // 3, 3)
+        trimmed = " ".join(words[:cut])
+        if trimmed and trimmed[-1] not in ".!?":
+            trimmed += "."
+        new_sentence = trimmed
+
+    other_sents = [s for j, s in enumerate(sentences) if j != sentence_index]
+    replacement_parts = _split_into_sentences(new_sentence)
+    if not replacement_parts:
+        replacement_parts = [new_sentence]
+
+    if action == "elaborate" and len(replacement_parts) > 2:
+        logger.info("[refine] elaborate produced %d sentences, keeping first 2", len(replacement_parts))
+        replacement_parts = replacement_parts[:2]
+
+    filtered = []
+    for part in replacement_parts:
+        is_dup = any(
+            _sentence_similarity(part, other) > 0.65
+            for other in other_sents
+        )
+        if is_dup:
+            logger.info("[refine] dropping near-duplicate of unchanged sentence: %r", part[:120])
+        else:
+            filtered.append(part)
+
+    if not filtered:
+        filtered = replacement_parts[:1]
+
+    out = sentences[:]
+    out[sentence_index] = " ".join(filtered)
+    assembled = " ".join(out)
+
+    final_sents = _split_into_sentences(assembled)
+    seen = set()
+    deduped = []
+    for s in final_sents:
+        norm = s.lower().strip().rstrip(".")
+        if norm not in seen:
+            seen.add(norm)
+            deduped.append(s)
+    assembled = " ".join(deduped)
+
+    return assembled
+
+
+def run_refine_optimized_full(
+    original_user_prompt: str,
+    initial_optimized: str,
+    current_optimized: str,
+) -> str:
+    user_block = (
+        f"Original user prompt:\n{original_user_prompt}\n\n"
+        f"The first optimized version was:\n{initial_optimized}\n\n"
+        f"The current optimized prompt is:\n{current_optimized}\n\n"
+        "Write a new optimized prompt for the same user intent. "
+        "It must be meaningfully different from the current text (structure, emphasis, or constraints), "
+        "not a small edit. 2–3 sentences, under 110 words. Output only the new prompt."
+    )
+    messages = [
+        {"role": "system", "content": OPTIMIZE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_block},
+    ]
+    raw = _generate_opt_bpo_sampled(messages, max_new_tokens=200)
+    return _cleanup_optimized_output(raw)
+
+
+def run_optimize(prompt: str) -> str:
     def _rewrite_failure_reason(text, original):
         t = text.lower().strip()
         o = original.lower().strip()
@@ -375,7 +645,7 @@ def run_optimize(prompt: str) -> str:
             ),
         },
     ]
-    reply = _cleanup(_generate(primary_messages))
+    reply = _cleanup_optimized_output(_generate_opt_bpo(primary_messages))
     primary_reason = _rewrite_failure_reason(reply, prompt)
     if primary_reason is None:
         return reply
@@ -402,7 +672,7 @@ def run_optimize(prompt: str) -> str:
             ),
         },
     ]
-    retry = _cleanup(_generate(strict_messages, max_new_tokens=170))
+    retry = _cleanup_optimized_output(_generate_opt_bpo(strict_messages, max_new_tokens=170))
     retry_reason = _rewrite_failure_reason(retry, prompt)
     if retry_reason is not None:
         logger.warning(
@@ -835,6 +1105,55 @@ def generate_task_prompt():
     except Exception as e:
         logger.exception("generate_task_prompt failed")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/refine_optimized", methods=["POST"])
+def refine_optimized():
+    data = request.get_json() or {}
+    mode = (data.get("mode") or "").strip().lower()
+    original_user_prompt = (data.get("original_user_prompt") or "").strip()
+    full_optimized = (data.get("full_optimized") or "").strip()
+    initial_optimized = (data.get("initial_optimized") or "").strip() or full_optimized
+
+    if not original_user_prompt:
+        return jsonify({"error": "original_user_prompt required"}), 400
+
+    if mode == "sentence":
+        if not full_optimized:
+            return jsonify({"error": "full_optimized required"}), 400
+        try:
+            idx = int(data.get("sentence_index"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "sentence_index must be an integer"}), 400
+        action = (data.get("action") or "").strip().lower()
+        if action not in ("elaborate", "concise"):
+            return jsonify(
+                {"error": "action must be elaborate or concise"}
+            ), 400
+        try:
+            out = run_refine_optimized_sentence(
+                full_optimized, idx, action, original_user_prompt
+            )
+            return jsonify({"optimized": out})
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            logger.exception("refine_optimized sentence failed")
+            return jsonify({"error": str(e)}), 500
+
+    if mode == "full":
+        if not full_optimized:
+            return jsonify({"error": "full_optimized required"}), 400
+        try:
+            out = run_refine_optimized_full(
+                original_user_prompt, initial_optimized, full_optimized
+            )
+            return jsonify({"optimized": out})
+        except Exception as e:
+            logger.exception("refine_optimized full failed")
+            return jsonify({"error": str(e)}), 500
+
+    return jsonify({"error": 'mode must be "sentence" or "full"'}), 400
 
 
 if __name__ == "__main__":

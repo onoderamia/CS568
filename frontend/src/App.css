@@ -532,6 +532,97 @@ body {
   box-shadow: inset 0 0 0 1px var(--border);
 }
 
+.improved-prompt--interactive {
+  white-space: normal;
+}
+
+.refine-hint {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin: 8px 0 10px;
+  line-height: 1.45;
+}
+
+.opt-sentence {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 2px;
+  margin: 0 -2px;
+  transition:
+    background 0.12s,
+    box-shadow 0.12s;
+}
+
+.opt-sentence:hover {
+  background: rgba(124, 106, 245, 0.12);
+}
+
+.opt-sentence:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.opt-sentence--selected {
+  background: rgba(124, 106, 245, 0.22);
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+
+.opt-sentence--changed {
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 2px;
+}
+
+.refine-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.refine-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.refine-btn {
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
+}
+
+.refine-btn:hover:not(:disabled) {
+  border-color: var(--muted);
+  background: var(--surface2);
+}
+
+.refine-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.refine-btn--primary {
+  border-color: rgba(124, 106, 245, 0.45);
+  color: var(--accent);
+}
+
+.refine-error {
+  font-size: 12.5px;
+  color: #f87171;
+  margin: 8px 0 0;
+}
+
 /* ── Input area ── */
 
 .input-area {

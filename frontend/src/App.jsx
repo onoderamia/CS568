@@ -102,6 +102,13 @@ function CopyButton({ text }) {
   );
 }
 
+/** Match backend `_split_into_sentences` (sentence-ending punctuation + whitespace). */
+function splitOptimizedSentences(text) {
+  const t = (text || "").trim();
+  if (!t) return [];
+  return t.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+}
+
 /** value: mean dimension score 1–5 */
 function OverallScore({ value }) {
   const n = Number(value);
@@ -119,9 +126,105 @@ function OverallScore({ value }) {
   );
 }
 
-function CheckResult({ msg }) {
+function CheckResult({ msg, msgIndex, setMessages }) {
+  const [selectedSentenceIdx, setSelectedSentenceIdx] = useState(null);
+  const [refineBusy, setRefineBusy] = useState(false);
+  const [refineError, setRefineError] = useState(null);
+  const [changedIndices, setChangedIndices] = useState(new Set());
+
   const orderedDims =
     msg.scores && DIMENSION_ORDER.filter((d) => msg.scores[d] != null);
+  const sentences = splitOptimizedSentences(msg.improved);
+  const userPromptForRefine = (msg.userPrompt || "").trim();
+
+  const patchImprovedOnly = (optimized) => {
+    setMessages((prev) => {
+      const next = [...prev];
+      const cur = next[msgIndex];
+      if (cur && cur.type === "check") {
+        next[msgIndex] = { ...cur, improved: optimized };
+      }
+      return next;
+    });
+  };
+
+  const callRefine = async (body, sentenceIdx) => {
+    setRefineError(null);
+    setRefineBusy(true);
+    setChangedIndices(new Set());
+    const oldSentences = splitOptimizedSentences(msg.improved);
+    try {
+      const res = await fetch("/api/model/refine_optimized", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || "Refine request failed");
+      }
+      if (typeof data.optimized !== "string") {
+        throw new Error("Invalid refine response");
+      }
+      patchImprovedOnly(data.optimized);
+      setSelectedSentenceIdx(null);
+
+      const newSentences = splitOptimizedSentences(data.optimized);
+      if (body.mode === "full") {
+        setChangedIndices(new Set(newSentences.map((_, i) => i)));
+      } else {
+        const changed = new Set();
+        for (let i = 0; i < newSentences.length; i++) {
+          if (i >= oldSentences.length || newSentences[i] !== oldSentences[i]) {
+            changed.add(i);
+          }
+        }
+        if (changed.size === 0 && sentenceIdx != null) {
+          changed.add(sentenceIdx);
+        }
+        setChangedIndices(changed);
+      }
+    } catch (e) {
+      setRefineError(e.message || String(e));
+    } finally {
+      setRefineBusy(false);
+    }
+  };
+
+  const onSentenceAction = (action) => {
+    if (
+      selectedSentenceIdx == null ||
+      !msg.improved ||
+      !userPromptForRefine
+    ) {
+      return;
+    }
+    callRefine(
+      {
+        mode: "sentence",
+        original_user_prompt: userPromptForRefine,
+        full_optimized: msg.improved,
+        sentence_index: selectedSentenceIdx,
+        action,
+      },
+      selectedSentenceIdx,
+    );
+  };
+
+  const onFullRefresh = () => {
+    if (!msg.improved || !userPromptForRefine) return;
+    const initial =
+      msg.initialOptimized != null && String(msg.initialOptimized).trim()
+        ? String(msg.initialOptimized).trim()
+        : msg.improved;
+    callRefine({
+      mode: "full",
+      original_user_prompt: userPromptForRefine,
+      full_optimized: msg.improved,
+      initial_optimized: initial,
+    });
+  };
+
   return (
     <div className="message assistant">
       <div className="result-card">
@@ -175,7 +278,95 @@ function CheckResult({ msg }) {
               </h3>
               <CopyButton text={msg.improved} />
             </div>
-            <div className="improved-prompt">{msg.improved}</div>
+            <p className="refine-hint">
+              Click a sentence, then elaborate or shorten it. Or generate a
+              wholly new optimized prompt (scores above stay the same).
+            </p>
+            <div className="improved-prompt improved-prompt--interactive">
+              {sentences.length > 0 ? (
+                sentences.map((s, i) => (
+                  <span
+                    key={i}
+                    className={[
+                      "opt-sentence",
+                      selectedSentenceIdx === i && "opt-sentence--selected",
+                      changedIndices.has(i) && "opt-sentence--changed",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => {
+                      if (changedIndices.size > 0) {
+                        setChangedIndices(new Set());
+                        setSelectedSentenceIdx(null);
+                        return;
+                      }
+                      setSelectedSentenceIdx((prev) => (prev === i ? null : i));
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        if (changedIndices.size > 0) {
+                          setChangedIndices(new Set());
+                          setSelectedSentenceIdx(null);
+                          return;
+                        }
+                        setSelectedSentenceIdx((prev) => (prev === i ? null : i));
+                      }
+                    }}
+                  >
+                    {s}
+                    {i < sentences.length - 1 ? " " : ""}
+                  </span>
+                ))
+              ) : (
+                <span>{msg.improved}</span>
+              )}
+            </div>
+            <div className="refine-toolbar">
+              <div className="refine-actions">
+                <button
+                  type="button"
+                  className="refine-btn"
+                  disabled={
+                    refineBusy ||
+                    selectedSentenceIdx == null ||
+                    !userPromptForRefine
+                  }
+                  onClick={() => onSentenceAction("elaborate")}
+                >
+                  Elaborate
+                </button>
+                <button
+                  type="button"
+                  className="refine-btn"
+                  disabled={
+                    refineBusy ||
+                    selectedSentenceIdx == null ||
+                    !userPromptForRefine
+                  }
+                  onClick={() => onSentenceAction("concise")}
+                >
+                  More concise
+                </button>
+              </div>
+              <button
+                type="button"
+                className="refine-btn refine-btn--primary"
+                disabled={refineBusy || !msg.improved || !userPromptForRefine}
+                onClick={onFullRefresh}
+              >
+                New full optimized prompt
+              </button>
+            </div>
+            {!userPromptForRefine && (
+              <p className="refine-error">
+                Refine unavailable for this message (missing original prompt).
+                Start a new check to use refinement.
+              </p>
+            )}
+            {refineError && <p className="refine-error">{refineError}</p>}
           </div>
         )}
         {!msg.scores && !msg.improved && (
@@ -215,7 +406,7 @@ function GenerateResult({ msg }) {
 }
 
 
-function Message({ msg }) {
+function Message({ msg, msgIndex, setMessages }) {
   if (msg.role === "user") {
     return (
       <div className="message user">
@@ -223,7 +414,10 @@ function Message({ msg }) {
       </div>
     );
   }
-  if (msg.type === "check") return <CheckResult msg={msg} />;
+  if (msg.type === "check")
+    return (
+      <CheckResult msg={msg} msgIndex={msgIndex} setMessages={setMessages} />
+    );
   if (msg.type === "generate") return <GenerateResult msg={msg} />;
   return (
     <div className="message assistant">
@@ -323,6 +517,8 @@ export default function App() {
             overall: dims.overall,
             explanations: dims.explanations,
             draft_reply: dims.draft_reply,
+            userPrompt: text,
+            initialOptimized: opt.optimized,
             improved: opt.optimized,
           },
         ]);
@@ -401,7 +597,7 @@ export default function App() {
 
       <main className="chat-area">
         {messages.map((msg, i) => (
-          <Message key={i} msg={msg} />
+          <Message key={i} msg={msg} msgIndex={i} setMessages={setMessages} />
         ))}
         {loading && <Thinking />}
         <div ref={bottomRef} />
