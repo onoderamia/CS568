@@ -44,3 +44,4 @@ Thumbs.db
 
 # Optional: uncomment to avoid committing large adapter weights (get them from Colab/cloud instead)
 # models/
+.history

@@ -75,8 +75,6 @@ RATER_SYSTEM = (
 def _pick_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -162,11 +160,10 @@ Dimension scores (1=worst, 5=best):
 
 Return **one JSON object only** — no markdown, no code fences, no text before or after.
 Keys must be exactly: helpfulness, correctness, coherence, complexity, verbosity.
-Each value must be an **array of 2 or 3 strings**. Each string is one bullet sentence explaining why that score fits this prompt and how to improve it.
-Focus on clarity, specificity, constraints, format, audience, and scope of the prompt.
+Each value must be a **single short string** (1-2 sentences max). Say why the prompt got that score and one specific fix. Use plain, simple language — no jargon.
 
 Example shape (replace with real content):
-{{"helpfulness":["...","..."],"correctness":["...","..."],"coherence":["...","..."],"complexity":["...","..."],"verbosity":["...","..."]}}
+{{"helpfulness":"...","correctness":"...","coherence":"...","complexity":"...","verbosity":"..."}}
 """
 
 OPTIMIZE_SYSTEM_PROMPT = (
@@ -188,13 +185,15 @@ TASK_TO_PROMPT_SYSTEM = (
     "You are a prompt generation assistant. Convert a user's task, idea, or project request into "
     "one polished prompt that can be pasted into an AI system.\n\n"
     "STRICT RULES — follow all of them:\n"
-    "1. Output ONLY the final prompt. No explanation, no title, no markdown.\n"
-    "2. Preserve the user's goal exactly. Do not invent a different task.\n"
-    "3. Make the prompt specific, structured, and directly usable.\n"
-    "4. Include clear instructions, constraints, and an explicit output format when helpful.\n"
-    "5. If the user mentions a domain, language, framework, audience, or style, keep it.\n"
-    "6. Keep the prompt under 170 words.\n"
-    "7. Do not answer the task yourself; only write the prompt that should be given to another AI."
+    "1. NEVER answer, fulfill, execute, or respond to the user's task. "
+    "You are ONLY allowed to write a prompt — not perform the task itself.\n"
+    "2. Output ONLY the final prompt. No explanation, no title, no markdown, no commentary.\n"
+    "3. Preserve the user's goal exactly. Do not invent a different task.\n"
+    "4. Make the prompt specific, structured, and directly usable by an AI assistant.\n"
+    "5. Include clear instructions, constraints, and an explicit output format.\n"
+    "6. If the user mentions a domain, language, framework, audience, or style, keep it.\n"
+    "7. Keep the prompt under 170 words.\n"
+    "8. Never start with 'Here is', 'Here's', 'Sure', 'Prompt:', or any label — output the prompt as plain text only."
 )
 
 
@@ -730,6 +729,118 @@ def run_task_to_prompt(task_or_idea: str) -> str:
     return text
 
 
+def run_refine_generated_sentence(
+    full_generated: str,
+    sentence_index: int,
+    action: str,
+    original_user_idea: str,
+) -> str:
+    sentences = _split_into_sentences(full_generated)
+    if not sentences or sentence_index < 0 or sentence_index >= len(sentences):
+        raise ValueError("invalid sentence_index for this prompt")
+    if action not in ("elaborate", "concise"):
+        raise ValueError("action must be elaborate or concise")
+    target = sentences[sentence_index]
+    other_sentences = " ".join(s for j, s in enumerate(sentences) if j != sentence_index)
+
+    if action == "elaborate":
+        system = (
+            "You are a prompt editor. You add constraints, formatting requirements, or scope details "
+            "to a single instruction sentence inside a generated prompt. "
+            "You NEVER answer, explain, or perform the underlying task. "
+            "You ONLY add prompt-engineering details: output format, length constraints, "
+            "audience, scope, what to include/exclude, or evaluation criteria.\n\n"
+            "STRICT RULES:\n"
+            "1. Output ONLY the improved instruction sentence (1-2 sentences max).\n"
+            "2. Do NOT answer or explain the topic in any way.\n"
+            "3. Do NOT repeat or rephrase any other sentence from the prompt.\n"
+            "4. No labels, no quotes, no preamble, no commentary."
+        )
+        user_content = (
+            f"Original idea: {original_user_idea}\n\n"
+            f"This is one sentence from the generated prompt:\n{target}\n\n"
+            "Add prompt-engineering details to this sentence — output format, scope limits, "
+            "what to include/exclude, length, or audience. Do NOT answer the topic.\n\n"
+            "Do NOT repeat or rephrase these other sentences (they already exist in the prompt):\n"
+            + other_sentences
+        )
+        mt = 150
+    else:
+        system = (
+            "You shorten sentences. Given one sentence, output a shorter version with the same meaning. "
+            "No labels, no quotes, no preamble."
+        )
+        user_content = f"Shorten this sentence:\n{target}"
+        mt = 80
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+    raw = _generate_opt_bpo_sampled(messages, max_new_tokens=mt)
+    new_sentence = _cleanup_refined_sentence(raw, target, original_user_idea)
+
+    other_sents = [s for j, s in enumerate(sentences) if j != sentence_index]
+    replacement_parts = _split_into_sentences(new_sentence)
+    if not replacement_parts:
+        replacement_parts = [new_sentence]
+
+    if action == "elaborate" and len(replacement_parts) > 2:
+        replacement_parts = replacement_parts[:2]
+
+    filtered = []
+    for part in replacement_parts:
+        is_dup = any(
+            _sentence_similarity(part, other) > 0.65
+            for other in other_sents
+        )
+        if not is_dup:
+            filtered.append(part)
+    if not filtered:
+        filtered = replacement_parts[:1]
+
+    out = sentences[:]
+    out[sentence_index] = " ".join(filtered)
+    assembled = " ".join(out)
+
+    final_sents = _split_into_sentences(assembled)
+    seen = set()
+    deduped = []
+    for s in final_sents:
+        norm = s.lower().strip().rstrip(".")
+        if norm not in seen:
+            seen.add(norm)
+            deduped.append(s)
+    return " ".join(deduped)
+
+
+def run_refine_generated_full(
+    original_user_idea: str,
+    initial_generated: str,
+    current_generated: str,
+) -> str:
+    user_block = (
+        f"Original user idea:\n{original_user_idea}\n\n"
+        f"The first generated prompt was:\n{initial_generated}\n\n"
+        f"The current generated prompt is:\n{current_generated}\n\n"
+        "Write a new, meaningfully different generated prompt for the same idea "
+        "(vary structure, emphasis, or constraints). Under 170 words. Output only the new prompt."
+    )
+    messages = [
+        {"role": "system", "content": TASK_TO_PROMPT_SYSTEM},
+        {"role": "user", "content": user_block},
+    ]
+    raw = _generate_opt_bpo_sampled(messages, max_new_tokens=220)
+    text = _strip_optimize_meta_wrapper(raw)
+    for stop in ["<|im_end|>", "<|endoftext|>"]:
+        if stop in text:
+            text = text.split(stop)[0].strip()
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text or current_generated
+
+
 def _generate_with_score_model(
     messages: list,
     max_new_tokens: int,
@@ -905,32 +1016,23 @@ def run_helpsteer_json_rating(user_prompt: str, assistant_response: str) -> dict
     return scores
 
 
-def _bullets_from_gemini_value(v) -> str:
-    """Turn a JSON array of strings (or one string) into '- line\\n' text for the UI."""
-    parts: list[str] = []
-    if isinstance(v, list):
-        parts = [str(x).strip() for x in v if str(x).strip()]
-    elif isinstance(v, str) and v.strip():
-        parts = [p.strip() for p in re.split(r"[\n\r]+", v) if p.strip()]
-    out_lines: list[str] = []
-    for p in parts:
-        p = re.sub(r"^[-•*]\s*", "", p)
-        if p:
-            out_lines.append("- " + p)
-    return "\n".join(out_lines[:5])
 
 
 def _parse_gemini_feedback_json(raw: str) -> dict[str, str] | None:
-    """Parse single JSON object from Gemini into per-dimension bullet strings."""
+    """Parse single JSON object from Gemini into per-dimension paragraph strings."""
     parsed = _parse_json_object(raw)
     if not isinstance(parsed, dict):
         return None
     out: dict[str, str] = {}
     for dim in HELPSTEER_DIMENSIONS:
-        text = _bullets_from_gemini_value(parsed.get(dim))
-        n = sum(1 for line in text.splitlines() if line.strip().startswith("-"))
-        if n >= 1:
-            out[dim] = text
+        val = parsed.get(dim)
+        if isinstance(val, str) and val.strip():
+            out[dim] = val.strip()
+        elif isinstance(val, list):
+            # fallback: join array items into a paragraph
+            joined = " ".join(str(x).strip() for x in val if str(x).strip())
+            if joined:
+                out[dim] = joined
     return out if out else None
 
 
@@ -1151,6 +1253,49 @@ def refine_optimized():
             return jsonify({"optimized": out})
         except Exception as e:
             logger.exception("refine_optimized full failed")
+            return jsonify({"error": str(e)}), 500
+
+    return jsonify({"error": 'mode must be "sentence" or "full"'}), 400
+
+
+@app.route("/api/refine_generated", methods=["POST"])
+def refine_generated():
+    data = request.get_json() or {}
+    mode = (data.get("mode") or "").strip().lower()
+    original_user_idea = (data.get("original_user_idea") or "").strip()
+    full_generated = (data.get("full_generated") or "").strip()
+    initial_generated = (data.get("initial_generated") or "").strip() or full_generated
+
+    if not original_user_idea:
+        return jsonify({"error": "original_user_idea required"}), 400
+
+    if mode == "sentence":
+        if not full_generated:
+            return jsonify({"error": "full_generated required"}), 400
+        try:
+            idx = int(data.get("sentence_index"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "sentence_index must be an integer"}), 400
+        action = (data.get("action") or "").strip().lower()
+        if action not in ("elaborate", "concise"):
+            return jsonify({"error": "action must be elaborate or concise"}), 400
+        try:
+            out = run_refine_generated_sentence(full_generated, idx, action, original_user_idea)
+            return jsonify({"generated": out})
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            logger.exception("refine_generated sentence failed")
+            return jsonify({"error": str(e)}), 500
+
+    if mode == "full":
+        if not full_generated:
+            return jsonify({"error": "full_generated required"}), 400
+        try:
+            out = run_refine_generated_full(original_user_idea, initial_generated, full_generated)
+            return jsonify({"generated": out})
+        except Exception as e:
+            logger.exception("refine_generated full failed")
             return jsonify({"error": str(e)}), 500
 
     return jsonify({"error": 'mode must be "sentence" or "full"'}), 400

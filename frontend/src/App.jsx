@@ -382,7 +382,89 @@ function CheckResult({ msg, msgIndex, setMessages }) {
   );
 }
 
-function GenerateResult({ msg }) {
+function GenerateResult({ msg, msgIndex, setMessages }) {
+  const [selectedSentenceIdx, setSelectedSentenceIdx] = useState(null);
+  const [refineBusy, setRefineBusy] = useState(false);
+  const [refineError, setRefineError] = useState(null);
+  const [changedIndices, setChangedIndices] = useState(new Set());
+
+  const sentences = splitOptimizedSentences(msg.prompt);
+  const userIdea = (msg.userIdea || "").trim();
+
+  const patchPromptOnly = (generated) => {
+    setMessages((prev) => {
+      const next = [...prev];
+      const cur = next[msgIndex];
+      if (cur && cur.type === "generate") {
+        next[msgIndex] = { ...cur, prompt: generated };
+      }
+      return next;
+    });
+  };
+
+  const callRefine = async (body, sentenceIdx) => {
+    setRefineError(null);
+    setRefineBusy(true);
+    setChangedIndices(new Set());
+    const oldSentences = splitOptimizedSentences(msg.prompt);
+    try {
+      const res = await fetch("/api/model/refine_generated", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Refine request failed");
+      if (typeof data.generated !== "string") throw new Error("Invalid refine response");
+      patchPromptOnly(data.generated);
+      setSelectedSentenceIdx(null);
+
+      const newSentences = splitOptimizedSentences(data.generated);
+      if (body.mode === "full") {
+        setChangedIndices(new Set(newSentences.map((_, i) => i)));
+      } else {
+        const changed = new Set();
+        for (let i = 0; i < newSentences.length; i++) {
+          if (i >= oldSentences.length || newSentences[i] !== oldSentences[i]) changed.add(i);
+        }
+        if (changed.size === 0 && sentenceIdx != null) changed.add(sentenceIdx);
+        setChangedIndices(changed);
+      }
+    } catch (e) {
+      setRefineError(e.message || String(e));
+    } finally {
+      setRefineBusy(false);
+    }
+  };
+
+  const onSentenceAction = (action) => {
+    if (selectedSentenceIdx == null || !msg.prompt || !userIdea) return;
+    callRefine(
+      {
+        mode: "sentence",
+        original_user_idea: userIdea,
+        full_generated: msg.prompt,
+        sentence_index: selectedSentenceIdx,
+        action,
+      },
+      selectedSentenceIdx,
+    );
+  };
+
+  const onFullRefresh = () => {
+    if (!msg.prompt || !userIdea) return;
+    const initial =
+      msg.initialPrompt != null && String(msg.initialPrompt).trim()
+        ? String(msg.initialPrompt).trim()
+        : msg.prompt;
+    callRefine({
+      mode: "full",
+      original_user_idea: userIdea,
+      full_generated: msg.prompt,
+      initial_generated: initial,
+    });
+  };
+
   return (
     <div className="message assistant">
       <div className="result-card">
@@ -393,13 +475,88 @@ function GenerateResult({ msg }) {
             </h3>
             <CopyButton text={msg.prompt} />
           </div>
-          <div className="improved-prompt">{msg.prompt}</div>
-        </div>
-        {msg.explanation && (
-          <div className="result-section">
-            <p className="feedback-text">{msg.explanation}</p>
+          <p className="refine-hint">
+            Click a sentence, then elaborate or shorten it. Or generate a
+            wholly new prompt from your idea.
+          </p>
+          <div className="improved-prompt improved-prompt--interactive">
+            {sentences.length > 0 ? (
+              sentences.map((s, i) => (
+                <span
+                  key={i}
+                  className={[
+                    "opt-sentence",
+                    selectedSentenceIdx === i && "opt-sentence--selected",
+                    changedIndices.has(i) && "opt-sentence--changed",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    if (changedIndices.size > 0) {
+                      setChangedIndices(new Set());
+                      setSelectedSentenceIdx(null);
+                      return;
+                    }
+                    setSelectedSentenceIdx((prev) => (prev === i ? null : i));
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (changedIndices.size > 0) {
+                        setChangedIndices(new Set());
+                        setSelectedSentenceIdx(null);
+                        return;
+                      }
+                      setSelectedSentenceIdx((prev) => (prev === i ? null : i));
+                    }
+                  }}
+                >
+                  {s}
+                  {i < sentences.length - 1 ? " " : ""}
+                </span>
+              ))
+            ) : (
+              <span>{msg.prompt}</span>
+            )}
           </div>
-        )}
+          <div className="refine-toolbar">
+            <div className="refine-actions">
+              <button
+                type="button"
+                className="refine-btn"
+                disabled={refineBusy || selectedSentenceIdx == null || !userIdea}
+                onClick={() => onSentenceAction("elaborate")}
+              >
+                Elaborate
+              </button>
+              <button
+                type="button"
+                className="refine-btn"
+                disabled={refineBusy || selectedSentenceIdx == null || !userIdea}
+                onClick={() => onSentenceAction("concise")}
+              >
+                More concise
+              </button>
+            </div>
+            <button
+              type="button"
+              className="refine-btn refine-btn--primary"
+              disabled={refineBusy || !msg.prompt || !userIdea}
+              onClick={onFullRefresh}
+            >
+              New generated prompt
+            </button>
+          </div>
+          {!userIdea && (
+            <p className="refine-error">
+              Refine unavailable for this message (missing original idea).
+              Start a new conversation to use refinement.
+            </p>
+          )}
+          {refineError && <p className="refine-error">{refineError}</p>}
+        </div>
       </div>
     </div>
   );
@@ -418,7 +575,7 @@ function Message({ msg, msgIndex, setMessages }) {
     return (
       <CheckResult msg={msg} msgIndex={msgIndex} setMessages={setMessages} />
     );
-  if (msg.type === "generate") return <GenerateResult msg={msg} />;
+  if (msg.type === "generate") return <GenerateResult msg={msg} msgIndex={msgIndex} setMessages={setMessages} />;
   return (
     <div className="message assistant">
       <div
@@ -462,11 +619,14 @@ export default function App() {
     INIT_MESSAGES.generate,
   );
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [checkLoading, setCheckLoading] = useState(false);
+  const [generateLoading, setGenerateLoading] = useState(false);
   const bottomRef = useRef(null);
 
   const messages = mode === "check" ? checkMessages : generateMessages;
   const setMessages = mode === "check" ? setCheckMessages : setGenerateMessages;
+  const loading = mode === "check" ? checkLoading : generateLoading;
+  const setLoading = mode === "check" ? setCheckLoading : setGenerateLoading;
 
   // Whether a prompt has been submitted in the current mode (hide input after first submit)
   const submitted = messages.some((m) => m.role === "user");
@@ -548,8 +708,8 @@ export default function App() {
             role: "assistant",
             type: "generate",
             prompt: data.generated_prompt,
-            explanation:
-              "This prompt was generated from your idea or task and structured for clarity, context, and AI effectiveness.",
+            initialPrompt: data.generated_prompt,
+            userIdea: text,
           },
         ]);
       } catch {
