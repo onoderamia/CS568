@@ -718,6 +718,12 @@ def run_task_to_prompt(task_or_idea: str) -> str:
         "Here is a prompt:",
         "Here's a prompt:",
         "Final prompt:",
+        "Here is a strong, ready-to-use prompt for an AI assistant:",
+        "Here's a strong, ready-to-use prompt for an AI assistant:",
+        "Here is a strong prompt for an AI assistant:",
+        "Here's a strong prompt:",
+        "Here is a ready-to-use prompt:",
+        "Here's a ready-to-use prompt:",
     ]
     for prefix in prefixes_to_strip:
         if text.lower().startswith(prefix.lower()):
@@ -1074,10 +1080,12 @@ def _run_gemini_explanations(
     raw = ""
     for attempt in range(max_attempts):
         try:
+            t0_gemini = time.perf_counter()
             response = _gemini_client.models.generate_content(
                 model=GEMINI_FEEDBACK_MODEL,
                 contents=prompt_text,
             )
+            logger.info("[latency] gemini_explanations=%.3fs", time.perf_counter() - t0_gemini)
             raw = (response.text or "").strip()
             break
         except Exception as e:
@@ -1155,8 +1163,10 @@ def run_base_explanations(
 
 def run_score_pipeline(user_prompt: str, response_override: str | None) -> dict:
     draft = (response_override or "").strip() or _draft_assistant_reply(user_prompt)
+    t0_smollm = time.perf_counter()
     scores = run_helpsteer_json_rating(user_prompt, draft)
-    overall = int(round(sum(scores.values()) / len(scores)))
+    logger.info("[latency] score_dims_smollm=%.3fs", time.perf_counter() - t0_smollm)
+    overall = round(sum(scores.values()) / len(scores), 1)
     explanations = run_base_explanations(user_prompt, draft, scores)
     return {
         "overall": overall,
@@ -1173,7 +1183,11 @@ def optimize():
     if not prompt:
         return jsonify({"error": "No prompt provided"}), 400
     try:
-        return jsonify({"optimized": run_optimize(prompt)})
+        t0 = time.perf_counter()
+        result = run_optimize(prompt)
+        elapsed = time.perf_counter() - t0
+        logger.info("[latency] optimize=%.3fs", elapsed)
+        return jsonify({"optimized": result, "latency_s": round(elapsed, 3)})
     except Exception as e:
         logger.exception("optimize failed")
         return jsonify({"error": str(e)}), 500
@@ -1189,7 +1203,11 @@ def score_dims():
     if not prompt:
         return jsonify({"error": "No prompt provided"}), 400
     try:
+        t0 = time.perf_counter()
         result = run_score_pipeline(prompt, response_override)
+        elapsed = time.perf_counter() - t0
+        logger.info("[latency] score_dims=%.3fs", elapsed)
+        result["latency_s"] = round(elapsed, 3)
         return jsonify(result)
     except Exception as e:
         logger.exception("score_dims failed")
@@ -1203,7 +1221,11 @@ def generate_task_prompt():
     if not task:
         return jsonify({"error": "No prompt provided"}), 400
     try:
-        return jsonify({"generated_prompt": run_task_to_prompt(task)})
+        t0 = time.perf_counter()
+        result = run_task_to_prompt(task)
+        elapsed = time.perf_counter() - t0
+        logger.info("[latency] generate_task_prompt=%.3fs", elapsed)
+        return jsonify({"generated_prompt": result, "latency_s": round(elapsed, 3)})
     except Exception as e:
         logger.exception("generate_task_prompt failed")
         return jsonify({"error": str(e)}), 500
