@@ -1,10 +1,10 @@
 # PromptLab
 
-A React + Vite web app that uses Claude to analyze and improve AI prompts. Built for CS 568 (UIUC).
+A web app that scores and rewrites AI prompts, powered by a fine-tuned local model. Built for CS 568 (UIUC).
 
-## Demo
+## Demo (linked)
 
-[![Watch the demo](https://img.youtube.com/vi/v9mqQYmustw/0.jpg)](https://youtu.be/v9mqQYmustw) (linked)
+[![Watch the demo](https://img.youtube.com/vi/v9mqQYmustw/0.jpg)](https://youtu.be/v9mqQYmustw)
 
 ## Features
 
@@ -12,11 +12,15 @@ A React + Vite web app that uses Claude to analyze and improve AI prompts. Built
 
 **Generate Prompt mode:** describe an idea in plain language and get a ready to use prompt, with an explanation of what was improved.
 
-Recent history lets you click any past entry to restore it.
-
 ## Tech Stack
 
-React 18 + Vite, Anthropic Claude API (called directly from the browser), no component library.
+**Frontend:** React 18 + Vite
+
+**Backend:** Flask API serving a fine-tuned [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) with custom LoRA adapters:
+- a BPO (black-box prompt optimization) adapter that rewrites prompts
+- a HelpSteer-trained rater adapter that scores prompts across clarity, specificity, tone, and ambiguity
+
+Google Gemini is used for auxiliary explanation text on the scored feedback.
 
 ## Figures
 
