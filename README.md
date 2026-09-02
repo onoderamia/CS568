@@ -4,7 +4,7 @@ A React + Vite web app that uses Claude to analyze and improve AI prompts. Built
 
 ## Demo
 
-[![Watch the demo](https://img.youtube.com/vi/v9mqQYmustw/0.jpg)](https://youtu.be/v9mqQYmustw)
+[![Watch the demo](https://img.youtube.com/vi/v9mqQYmustw/0.jpg)](https://youtu.be/v9mqQYmustw) (linked)
 
 ## Features
 
